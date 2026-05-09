@@ -8,7 +8,7 @@ Extended further with DS-STAR agent schemas.
 
 from enum import Enum
 from typing import List, Dict, Any, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class AnalysisMode(str, Enum):
@@ -40,6 +40,7 @@ class DatasetUploadRecord(BaseModel):
     file_size: int
     extension: str
     analysis_mode: bool = True
+    workspace_id: Optional[str] = None
     created_at: Optional[str] = None
 
 
@@ -110,12 +111,27 @@ class AgentEvent(BaseModel):
 class AgentRunRequest(BaseModel):
     """Request body for the /agent/run endpoint."""
 
-    query: str
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=5000,
+        description="The analytical question or instruction for the DS-STAR agent.",
+    )
     session_id: Optional[str] = None
     workspace_id: Optional[str] = None
     # ── Per-run LLM / agent customisation ─────────────────────────────────
-    max_rounds: Optional[int] = None        # 1–10; overrides MAX_AGENT_ROUNDS
+    max_rounds: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=10,
+        description="Number of agent reasoning rounds (1–10). Overrides MAX_AGENT_ROUNDS.",
+    )
     model: Optional[str] = None             # reasoning model override
     coder_model: Optional[str] = None       # code-generation model override
-    temperature: Optional[float] = None     # 0.0–1.0 sampling temperature
+    temperature: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Sampling temperature (0.0–1.0).",
+    )
 

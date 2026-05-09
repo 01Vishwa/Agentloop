@@ -9,8 +9,8 @@ Gap fixes applied:
 - Added ``execution_output`` parameter so the router sees actual error tracebacks.
 """
 
+import asyncio
 import logging
-import threading
 from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -133,29 +133,33 @@ class RouterAgent:
         self._model = model
         self._temperature = temperature if temperature is not None else 0.1
         self._chain = None  # lazily built
-        self._lock = threading.Lock()  # thread-safe lazy init
+        self._lock = asyncio.Lock()  # async-safe lazy init
 
-    def _get_chain(self):
-        """Builds and caches the structured-output LangChain pipeline."""
-        with self._lock:
-            if self._chain is None:
-                from core.llm_client import get_nim_llm  # pylint: disable=import-outside-toplevel
-                llm = get_nim_llm(model=self._model, temperature=self._temperature)
-                structured_llm = llm.with_structured_output(RouterOutput)
-                self._chain = (
-                    ChatPromptTemplate.from_messages([
-                        ("system", _ROUTER_SYSTEM),
-                        ("human", _ROUTER_HUMAN),
-                    ])
-                    | structured_llm
-                )
-        return self._chain
+    def _build_chain(self):
+        """Builds (but does NOT cache) the LangChain pipeline.
+
+        Heavy work — LLM init, imports — happens here, OUTSIDE the async lock.
+        """
+        from core.llm_client import get_structured_llm  # pylint: disable=import-outside-toplevel
+        structured_llm = get_structured_llm(
+            model=self._model,
+            schema=RouterOutput,
+            temperature=self._temperature,
+        )
+        return (
+            ChatPromptTemplate.from_messages([
+                ("system", _ROUTER_SYSTEM),
+                ("human", _ROUTER_HUMAN),
+            ])
+            | structured_llm
+        )
 
     async def route(
         self,
         query: str,
         plan_steps: List[Dict[str, Any]],
         verifier_reason: str,
+        data_description: str = "",
         execution_output: str = "",
         token_tracker: Optional[TokenTracker] = None,
     ) -> Dict[str, Any]:
@@ -174,6 +178,10 @@ class RouterAgent:
             Dict with keys ``action``, ``step_index``, ``remove_from_index``,
             ``new_step``.
         """
+        # data_description is accepted for backward compatibility (tests / older callers),
+        # but intentionally not used in the prompt to conserve tokens.
+        _ = data_description
+
         formatted_steps = "\n".join(
             f"  Step {s['index'] + 1}: {s['description']}"
             for s in plan_steps
@@ -182,7 +190,13 @@ class RouterAgent:
         # Pass enough execution output for the router to see late-appearing
         # tracebacks (raised from 1500 → 3000 chars).
         exec_excerpt = execution_output[:3000] if execution_output else "(none)"
-        result: RouterOutput = await self._get_chain().ainvoke(
+        if self._chain is None:
+            built = self._build_chain()      # heavy work — no lock held
+            async with self._lock:
+                if self._chain is None:      # double-checked locking
+                    self._chain = built
+        chain = self._chain
+        result: RouterOutput = await chain.ainvoke(
             {
                 "query": query,
                 "plan_steps": formatted_steps,
@@ -200,9 +214,25 @@ class RouterAgent:
             result.new_step.description[:60],
         )
 
+        # GAP 7 fix: guard against REMOVE_STEPS without a valid remove_from_index.
+        # If the LLM chose REMOVE_STEPS but forgot to set the index, coerce to
+        # FIX_STEP at step 0 so the planner still makes a meaningful repair
+        # rather than silently falling through to ADD_STEP.
+        action = result.action
+        step_index = result.step_index
+        remove_from_index = result.remove_from_index
+
+        if action == "REMOVE_STEPS" and remove_from_index is None:
+            logger.warning(
+                "[Router] REMOVE_STEPS action missing remove_from_index — "
+                "coercing to FIX_STEP at step 0."
+            )
+            action = "FIX_STEP"
+            step_index = step_index if step_index is not None else 0
+
         return {
-            "action": result.action,
-            "step_index": result.step_index,
-            "remove_from_index": result.remove_from_index,
+            "action": action,
+            "step_index": step_index,
+            "remove_from_index": remove_from_index,
             "new_step": result.new_step.model_dump(),
         }

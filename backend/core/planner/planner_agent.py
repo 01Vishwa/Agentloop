@@ -10,8 +10,8 @@ Gap fixes applied:
 - Task-type hint added to system prompt.
 """
 
+import asyncio
 import logging
-import threading
 from typing import Any, Dict, List, Optional
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -73,6 +73,34 @@ _INITIAL_PLAN_HUMAN = (
     "DATA DESCRIPTION:\n{data_description}"
 )
 
+# ---------------------------------------------------------------------------
+# Sequential/adaptive next-step prompt (DS-STAR paper GAP 4 fix)
+# Used on rounds 2+ when previous execution output is available.
+# The planner generates ONE new step conditioned on what was found so far.
+# ---------------------------------------------------------------------------
+
+_NEXT_STEP_SYSTEM = (
+    "You are an expert data science planner operating in SEQUENTIAL mode.\n"
+    "The analysis is already in progress. You have been given:\n"
+    "  - The original user query\n"
+    "  - The data description\n"
+    "  - The steps already completed and their execution output\n\n"
+    "Your task: produce EXACTLY ONE next step that logically follows "
+    "from the current results and moves the analysis closer to answering the query.\n\n"
+    "Rules:\n"
+    "- Output a plan with EXACTLY ONE step (the next action only).\n"
+    "- The step must be conditioned on what the previous execution revealed.\n"
+    "- Do not repeat steps that are already complete.\n"
+    "- Be concrete: reference actual column names or values from the execution output.\n"
+)
+
+_NEXT_STEP_HUMAN = (
+    "USER QUERY:\n{query}\n\n"
+    "DATA DESCRIPTION:\n{data_description}\n\n"
+    "STEPS COMPLETED SO FAR:\n{completed_steps}\n\n"
+    "LAST EXECUTION OUTPUT (what was discovered):\n{execution_output}"
+)
+
 
 # ---------------------------------------------------------------------------
 # Agent
@@ -97,29 +125,42 @@ class PlannerAgent:
         self._model = model
         self._temperature = temperature if temperature is not None else 0.1
         self._chain = None
-        self._lock = threading.Lock()   # thread-safe lazy init (matches PlannerAgent)
+        self._lock = asyncio.Lock()  # async-safe lazy init
 
-    def _get_chain(self):
-        """Builds and caches the structured-output LangChain pipeline."""
-        with self._lock:
-            if self._chain is None:
-                from core.llm_client import get_nim_llm  # pylint: disable=import-outside-toplevel
-                llm = get_nim_llm(model=self._model, temperature=self._temperature)
-                structured_llm = llm.with_structured_output(PlanOutput)
-                self._chain = (
-                    ChatPromptTemplate.from_messages([
-                        ("system", _INITIAL_PLAN_SYSTEM),
-                        ("human", _INITIAL_PLAN_HUMAN),
-                    ])
-                    | structured_llm
-                )
-        return self._chain
+    def _build_chain(self):
+        """Builds (but does NOT cache) the LangChain pipeline.
+
+        Heavy work — LLM init, imports — happens here, OUTSIDE the async lock.
+        """
+        from core.llm_client import get_structured_llm  # pylint: disable=import-outside-toplevel
+        llm_structured = get_structured_llm(
+            model=self._model,
+            schema=PlanOutput,
+            temperature=self._temperature,
+        )
+        return (
+            ChatPromptTemplate.from_messages([
+                ("system", _INITIAL_PLAN_SYSTEM),
+                ("human", _INITIAL_PLAN_HUMAN),
+            ])
+            | llm_structured
+        )
 
     async def create_plan(
         self, query: str, data_description: str,
         token_tracker: Optional[TokenTracker] = None,
+        execution_output: str = "",
+        completed_steps: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
-        """Generates the initial plan from the query and data description.
+        """Generates or extends the analysis plan.
+
+        On the first round (``execution_output`` is empty), generates a full
+        multi-step plan from the query and data description.
+
+        On subsequent rounds (``execution_output`` provided), switches to
+        SEQUENTIAL mode: generates EXACTLY ONE next step conditioned on the
+        previous execution output. This matches the paper's adaptive planning
+        description where each round's step is grounded in what was discovered.
 
         Args:
             query: The user's natural language question.
@@ -127,6 +168,9 @@ class PlannerAgent:
             token_tracker: Optional run-level tracker.  When provided, token
                 usage from this LLM call is recorded automatically via a
                 LangChain callback.
+            execution_output: stdout/stderr from the previous round (if any).
+                When non-empty, activates sequential/adaptive planning mode.
+            completed_steps: Steps already completed (for sequential mode context).
 
         Returns:
             Ordered list of plan step dicts.
@@ -135,14 +179,76 @@ class PlannerAgent:
             Exception: Propagated to the orchestrator so ``_with_retry`` can
                 retry on transient LLM failures. Do NOT catch here.
         """
-        result: PlanOutput = await self._get_chain().ainvoke(
-            {
-                "query": query,
-                "data_description": data_description,
-            },
-            config=tracker_callback_config(token_tracker),
-        )
-        steps = [s.model_dump() for s in result.steps]
+        is_sequential = bool(execution_output and execution_output.strip())
+
+        if is_sequential:
+            # ── Sequential mode: generate ONE next step conditioned on results ──
+            # Build a fresh chain with the next-step prompt (not cached, since
+            # this prompt is per-round by design).
+            from core.llm_client import get_structured_llm  # pylint: disable=import-outside-toplevel
+            next_step_llm = get_structured_llm(
+                model=self._model,
+                schema=PlanOutput,
+                temperature=self._temperature,
+            )
+            next_step_chain = (
+                ChatPromptTemplate.from_messages([
+                    ("system", _NEXT_STEP_SYSTEM),
+                    ("human", _NEXT_STEP_HUMAN),
+                ])
+                | next_step_llm
+            )
+            completed_str = "\n".join(
+                f"  Step {s['index'] + 1}: {s['description']} [{s.get('status', 'done')}]"
+                for s in (completed_steps or [])
+            ) or "(none yet)"
+            result: PlanOutput = await next_step_chain.ainvoke(
+                {
+                    "query": query,
+                    "data_description": data_description,
+                    "completed_steps": completed_str,
+                    "execution_output": execution_output[:2000],
+                },
+                config=tracker_callback_config(token_tracker),
+            )
+            # Sequential mode should return 1 step; use the first if more
+            steps = [result.steps[0].model_dump()] if result.steps else []
+            logger.info(
+                "[Planner] Sequential mode — next step: %s",
+                steps[0]['description'][:80] if steps else "(none)",
+            )
+        else:
+            # ── Initial mode: full multi-step plan ──────────────────────────────
+            if self._chain is None:
+                built = self._build_chain()      # heavy work — no lock held
+                async with self._lock:
+                    if self._chain is None:      # double-checked locking
+                        self._chain = built
+            chain = self._chain
+            result = await chain.ainvoke(
+                {
+                    "query": query,
+                    "data_description": data_description,
+                },
+                config=tracker_callback_config(token_tracker),
+            )
+            steps = [s.model_dump() for s in result.steps]
+
+        # Guard against occasional empty structured outputs.
+        if not steps:
+            logger.warning("[Planner] LLM returned 0 steps; using deterministic fallback.")
+            steps = [
+                {
+                    "index": 0,
+                    "description": "Inspect the available dataset schema and row counts.",
+                    "status": "pending",
+                },
+                {
+                    "index": 1,
+                    "description": f"Compute and present the requested result for: {query}",
+                    "status": "pending",
+                },
+            ]
         logger.info("[Planner] Created plan with %d steps.", len(steps))
         return steps
 

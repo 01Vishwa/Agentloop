@@ -1,5 +1,5 @@
 import React, { useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useLocation } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { AuthForm } from '../components/shared/AuthForm'
 import { Cpu, Zap, Network, Bot } from 'lucide-react'
@@ -7,14 +7,19 @@ import { Cpu, Zap, Network, Bot } from 'lucide-react'
 export function LandingPage() {
   const { isAuthenticated, loading } = useAuth()
   const navigate = useNavigate()
+  const location = useLocation()
+
+  // Only auto-redirect to /projects if the user is authenticated AND we are
+  // NOT arriving here as a result of a sign-out (which navigates to '/' while
+  // Supabase is still clearing the session — isAuthenticated briefly stays true).
+  const comingFromSignOut = location.state?.signedOut === true
 
   useEffect(() => {
-    if (!loading && isAuthenticated) {
+    if (!loading && isAuthenticated && !comingFromSignOut) {
       navigate('/projects', { replace: true })
     }
-  }, [isAuthenticated, loading, navigate])
+  }, [isAuthenticated, loading, navigate, comingFromSignOut])
 
-  // Optional loading state while checking session
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-[#f8fafc]">
@@ -59,10 +64,10 @@ export function LandingPage() {
           <h2 className="text-5xl font-extrabold tracking-tight text-slate-900 leading-[1.1] mb-6">
             Intelligent Data <br/>
             <span className="text-transparent bg-clip-text bg-gradient-to-r from-brand-600 to-violet-600">
-              Processing & Research
+              Processing &amp; Research
             </span>
           </h2>
-          
+
           <p className="text-lg text-slate-600 mb-10 leading-relaxed">
             Agentloop autonomously interprets, plans, codes, executes, and verifies complex data operations. Step into the future of Agentic AI.
           </p>
@@ -77,7 +82,7 @@ export function LandingPage() {
                 <p className="text-sm text-slate-500 mt-1">Plan → Code → Execute → Verify → Route in a secure sandboxed environment.</p>
               </div>
             </div>
-            
+
             <div className="flex items-start gap-4">
               <div className="p-2.5 rounded-xl bg-white shadow-sm border border-slate-200/60 text-violet-500 shrink-0">
                 <Network size={20} />
@@ -109,9 +114,6 @@ export function LandingPage() {
             <AuthForm onSuccess={() => navigate('/projects')} />
           </div>
         </div>
-        <p className="mt-8 text-sm text-slate-400">
-          Secure, authenticated access powered by Supabase.
-        </p>
       </div>
     </div>
   )

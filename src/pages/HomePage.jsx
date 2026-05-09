@@ -39,9 +39,11 @@ export function HomePage({ fileState, agentState }) {
     artifacts,
     historyRuns,
     historyLoading,
+    activeRunId,
     settings,
     setSettings,
     handleSubmit,
+    rerunLastQuery,
     handleReset,
     fetchHistory,
     loadRun,
@@ -53,6 +55,13 @@ export function HomePage({ fileState, agentState }) {
 
   const { user, isAuthenticated, signOut, loading: authLoading } = useAuth()
   const [showAuthModal, setShowAuthModal] = useState(false)
+
+  // Redirect if not authenticated
+  useEffect(() => {
+    if (!authLoading && !isAuthenticated) {
+      navigate('/', { replace: true })
+    }
+  }, [authLoading, isAuthenticated, navigate])
 
   // Sync workspace from URL parameter
   useEffect(() => {
@@ -118,7 +127,9 @@ export function HomePage({ fileState, agentState }) {
           <div className="flex items-center gap-3">
             <Link
               to="/eval"
-              className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-slate-200 text-[12px] font-semibold bg-white text-slate-700 shadow-sm hover:bg-slate-50 transition-colors"
+              className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-slate-200
+                         text-[12px] font-semibold bg-white text-slate-700
+                         shadow-sm hover:bg-slate-50 transition-colors"
             >
               <BarChart2 size={13} className="text-violet-600" />
             </Link>
@@ -130,13 +141,10 @@ export function HomePage({ fileState, agentState }) {
               placement="header"
             />
 
-
-
             {/* ── Auth control ── */}
             {!authLoading && (
               isAuthenticated ? (
                 <div className="flex items-center gap-2">
-                  {/* User avatar chip */}
                   <div
                     id="user-avatar-chip"
                     className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-slate-200
@@ -148,10 +156,9 @@ export function HomePage({ fileState, agentState }) {
                       {user?.email?.split('@')[0]}
                     </span>
                   </div>
-                  {/* Sign out */}
                   <button
                     id="sign-out-btn"
-                    onClick={() => { signOut(); navigate('/'); }}
+                    onClick={async () => { await signOut(); navigate('/', { state: { signedOut: true } }); }}
                     className="btn-ghost px-3 text-[12px]"
                     title="Sign out"
                   >
@@ -206,7 +213,6 @@ export function HomePage({ fileState, agentState }) {
 
           {/* Output area */}
           <div className="flex-1 space-y-4">
-            {/* History drawer */}
             <HistoryPanel
               historyRuns={historyRuns}
               historyLoading={historyLoading}
@@ -224,7 +230,9 @@ export function HomePage({ fileState, agentState }) {
               output={agentOutput}
               verifierFeedback={verifierFeedback}
               artifacts={artifacts}
+              activeRunId={activeRunId}
               onReset={handleReset}
+              onRerun={() => rerunLastQuery(sessionId)}
               runMetrics={runMetrics}
               totalRunMs={totalRunMs}
               complexity={complexity}
@@ -241,7 +249,6 @@ export function HomePage({ fileState, agentState }) {
         onCancel={() => {}}
       />
 
-      {/* Auth modal — mounted at page level to ensure correct z-index stacking */}
       <AuthModal
         isOpen={showAuthModal}
         onClose={() => setShowAuthModal(false)}
@@ -249,4 +256,3 @@ export function HomePage({ fileState, agentState }) {
     </div>
   )
 }
-

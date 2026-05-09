@@ -1,13 +1,16 @@
 import React, { useCallback } from 'react'
-import { UploadCloud, Trash2, FolderOpen } from 'lucide-react'
+import { UploadCloud, Trash2, FolderOpen, FolderKanban } from 'lucide-react'
 import { DropZone } from './DropZone'
 import { FileList } from './FileList'
 import { toast } from '../shared/Toast'
+import { useWorkspaceStore } from '../../stores/workspaceStore'
 
 export function FileUploadPanel({ files, onAddFiles, onRemoveFile, onClearAll }) {
   const handleRejected = useCallback((rejectedFiles) => {
     rejectedFiles.forEach((r) => toast(`"${r.name}" — ${r.reason}`, 'error'))
   }, [])
+
+  const { activeWorkspace } = useWorkspaceStore()
 
   return (
     <div className="h-full flex flex-col gap-4 min-h-0">
@@ -19,7 +22,17 @@ export function FileUploadPanel({ files, onAddFiles, onRemoveFile, onClearAll })
             <div className="w-8 h-8 rounded-lg bg-brand-50 border border-brand-100 flex items-center justify-center shadow-sm">
               <FolderOpen size={16} className="text-brand-600" />
             </div>
-            <h2 className="font-bold text-slate-800 text-base">Document Ingestion</h2>
+            <div>
+              <h2 className="font-bold text-slate-800 text-base leading-tight">Document Ingestion</h2>
+              {activeWorkspace?.name && (
+                <div className="flex items-center gap-1 mt-0.5">
+                  <FolderKanban size={10} className="text-brand-500 shrink-0" />
+                  <span className="text-[10px] font-semibold text-brand-600 truncate max-w-[160px]">
+                    {activeWorkspace.name}
+                  </span>
+                </div>
+              )}
+            </div>
           </div>
           {files.length > 0 && (
             <button
@@ -48,8 +61,14 @@ export function FileUploadPanel({ files, onAddFiles, onRemoveFile, onClearAll })
         <div className="flex-1 flex flex-col items-center justify-center text-center py-8 opacity-60">
           <UploadCloud size={32} className="text-slate-300 mb-2" />
           <p className="text-xs text-slate-400 font-medium">No files uploaded yet</p>
+          {activeWorkspace?.name && (
+            <p className="text-[10px] text-slate-300 font-medium mt-1">
+              Files are scoped to "{activeWorkspace.name}"
+            </p>
+          )}
         </div>
       )}
     </div>
   )
 }
+

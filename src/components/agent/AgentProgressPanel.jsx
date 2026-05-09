@@ -3,8 +3,10 @@ import ReactMarkdown from 'react-markdown'
 import {
   Brain, Terminal, GitBranch, Layers, RefreshCw,
   ChevronDown, ChevronUp, Cpu, CheckCircle2, XCircle,
-  Loader2, Sparkles, Image, FileText, Bug, FileCheck, Network, Activity, Edit3, LayoutList
+  Loader2, Sparkles, Image, FileText, Bug, FileCheck, Network, Activity, Edit3, LayoutList, Download
 } from 'lucide-react'
+import { useAuth } from '../../contexts/AuthContext'
+import { toast } from '../shared/Toast'
 import { PlanStepList } from './PlanStepList'
 import { CodeBlock } from './CodeBlock'
 import { AgentMetricsOverlay } from './AgentMetricsOverlay'
@@ -346,7 +348,9 @@ export function AgentProgressPanel({
   output,
   verifierFeedback,
   artifacts,
+  activeRunId,
   onReset,
+  onRerun,
   // Metrics props (from 'metrics' SSE event)
   runMetrics,
   totalRunMs,
@@ -363,10 +367,37 @@ export function AgentProgressPanel({
   const [artifactsCollapsed, setArtifactsCollapsed] = useState(false)
   const [insightsCollapsed, setInsightsCollapsed] = useState(false)
   const [reportCollapsed, setReportCollapsed] = useState(false)
+  const [isDownloading, setIsDownloading] = useState(false)
+  const { getAccessToken } = useAuth()
 
   const busy   = isActive(agentStatus)
   const done   = agentStatus === 'completed'
   const failed = agentStatus === 'failed'
+
+  const handleDownload = async () => {
+    if (!activeRunId) return
+    setIsDownloading(true)
+    try {
+      const token = getAccessToken()
+      const res = await fetch(`/api/agent/runs/${activeRunId}/download`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const blob = await res.blob()
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `agentloop-run-${activeRunId}.zip`
+      document.body.appendChild(a)
+      a.click()
+      window.URL.revokeObjectURL(url)
+      document.body.removeChild(a)
+    } catch (err) {
+      toast('Failed to download artifacts: ' + err.message, 'error')
+    } finally {
+      setIsDownloading(false)
+    }
+  }
 
   return (
     <div className="space-y-4">
@@ -389,14 +420,28 @@ export function AgentProgressPanel({
         </div>
 
         {(done || failed) && (
-          <button
-            id="agent-reset-btn"
-            onClick={onReset}
-            className="btn-ghost text-[12px] gap-1.5 shrink-0"
-          >
-            <RefreshCw size={13} />
-            New Run
-          </button>
+          <div className="flex items-center gap-2">
+            {done && activeRunId && (
+              <button
+                onClick={handleDownload}
+                disabled={isDownloading}
+                className="btn-ghost text-[12px] gap-1.5 shrink-0"
+                title="Download Artifacts (.zip)"
+              >
+                {isDownloading ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+                Download ZIP
+              </button>
+            )}
+            <button
+              id="agent-reset-btn"
+              onClick={onRerun || onReset}
+              className="btn-ghost text-[12px] gap-1.5 shrink-0"
+              title="Run the previous query again"
+            >
+              <RefreshCw size={13} />
+              Re-run
+            </button>
+          </div>
         )}
       </div>
 
@@ -615,11 +660,11 @@ export function AgentProgressPanel({
           {!insightsCollapsed && (
           <div className="px-5 pb-5 border-t border-slate-100 pt-4 space-y-4 animate-fade-in">
               {output.insights.summary && (
-                <div className="p-4 bg-slate-50 border border-slate-100 rounded-xl
+                <div className="p-4 bg-slate-50 border border-slate-100 rounded-xl overflow-x-auto
                                 prose prose-sm max-w-none
                                 prose-headings:text-slate-800 prose-headings:font-bold
                                 prose-headings:mt-3 prose-headings:mb-1
-                                prose-p:text-[13px] prose-p:text-slate-700 prose-p:leading-relaxed
+                                prose-p:text-[12px] prose-p:text-slate-700 prose-p:leading-relaxed prose-p:whitespace-pre-wrap prose-p:font-mono
                                 prose-li:text-[13px] prose-li:text-slate-600
                                 prose-strong:text-slate-800">
                   <ReactMarkdown>{output.insights.summary}</ReactMarkdown>

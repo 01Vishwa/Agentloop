@@ -11,10 +11,11 @@ from core.executor.code_executor import CodeExecutor, ExecutionResult
 # Basic execution — success path
 # ---------------------------------------------------------------------------
 
-def test_executor_simple_print():
+@pytest.mark.asyncio
+async def test_executor_simple_print():
     """Executor captures stdout from a simple Python script."""
     ex = CodeExecutor()
-    result = ex.run("print('hello ds-star')")
+    result = await ex.run("print('hello ds-star')")
 
     assert result.success is True
     assert "hello ds-star" in result.stdout
@@ -26,20 +27,22 @@ def test_executor_simple_print():
 # Failure path
 # ---------------------------------------------------------------------------
 
-def test_executor_syntax_error():
+@pytest.mark.asyncio
+async def test_executor_syntax_error():
     """Executor returns success=False and populates stderr on syntax errors."""
     ex = CodeExecutor()
-    result = ex.run("def broken(:\n    pass")
+    result = await ex.run("def broken(:\n    pass")
 
     assert result.success is False
     assert result.returncode != 0
     assert len(result.stderr) > 0
 
 
-def test_executor_runtime_error():
+@pytest.mark.asyncio
+async def test_executor_runtime_error():
     """Executor returns success=False on runtime exceptions."""
     ex = CodeExecutor()
-    result = ex.run("raise ValueError('test error')")
+    result = await ex.run("raise ValueError('test error')")
 
     assert result.success is False
     assert "ValueError" in result.stderr
@@ -49,7 +52,8 @@ def test_executor_runtime_error():
 # Timeout
 # ---------------------------------------------------------------------------
 
-def test_executor_timeout(monkeypatch):
+@pytest.mark.asyncio
+async def test_executor_timeout(monkeypatch):
     """Executor catches TimeoutExpired and returns a descriptive error."""
     import subprocess
     from unittest.mock import patch
@@ -61,7 +65,7 @@ def test_executor_timeout(monkeypatch):
     with patch("core.executor.code_executor.EXECUTION_TIMEOUT_SECONDS", 1):
         ex = CodeExecutor()
         # Sleep for longer than our patched 1-second timeout
-        result = ex.run("import time; time.sleep(10)")
+        result = await ex.run("import time; time.sleep(10)")
 
     assert result.success is False
     assert "timed out" in result.stderr.lower() or "timeout" in result.stderr.lower()
@@ -71,7 +75,8 @@ def test_executor_timeout(monkeypatch):
 # Artifact collection
 # ---------------------------------------------------------------------------
 
-def test_executor_artifact_png():
+@pytest.mark.asyncio
+async def test_executor_artifact_png():
     """Executor collects PNG files written to ./outputs/ and base64-encodes them."""
     code = """
 import os, base64
@@ -89,7 +94,7 @@ with open('./outputs/test_plot.png', 'wb') as f:
 print('done')
 """
     ex = CodeExecutor()
-    result = ex.run(code)
+    result = await ex.run(code)
 
     assert result.success is True
     assert "test_plot.png" in result.artifacts
@@ -99,7 +104,8 @@ print('done')
     assert decoded[:4] == b'\x89PNG'
 
 
-def test_executor_artifact_csv():
+@pytest.mark.asyncio
+async def test_executor_artifact_csv():
     """Executor collects CSV files written to ./outputs/."""
     code = """
 import os
@@ -109,7 +115,7 @@ with open('./outputs/results.csv', 'w') as f:
 print('csv written')
 """
     ex = CodeExecutor()
-    result = ex.run(code)
+    result = await ex.run(code)
 
     assert result.success is True
     assert "results.csv" in result.artifacts
@@ -118,10 +124,11 @@ print('csv written')
     assert "alpha" in content
 
 
-def test_executor_no_artifacts_by_default():
+@pytest.mark.asyncio
+async def test_executor_no_artifacts_by_default():
     """Scripts that don't write to outputs/ yield an empty artifacts dict."""
     ex = CodeExecutor()
-    result = ex.run("print('no artifacts here')")
+    result = await ex.run("print('no artifacts here')")
 
     assert result.artifacts == {}
 

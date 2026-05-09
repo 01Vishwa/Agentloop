@@ -12,22 +12,27 @@ Gap fixes applied:
   rather than a pure file-count label.
 - REMOVE_STEPS router action now wired to PlannerAgent.remove_steps_from().
 - VerifierAgent now receives artifact_names from ExecutionResult.
-- RouterAgent.route() now receives execution_output (tracebacks).
+- RouterAgent.route() now receives execution_output (tracebacks) [GAP-01].
 - CodeExecutor.run() is now awaited (it became async in the executor fix).
 - Per-round timing, SSE events, and retry logic unchanged.
 - [DS-STAR v2] DebuggerAgent wired into execution failure path (max 3 retries).
 - [DS-STAR v2] FinalizerAgent wired into post-verification success path.
+- [DS-STAR v3 / GAP-02] Sequential PlannerAgent mode wired into round 2+ ADD_STEP
+  path so each new exploratory step is conditioned on actual execution output.
+- [DS-STAR v3 / GAP-03] Debugger now receives _schema_hints not raw description.
+- [DS-STAR v3 / GAP-06] Debugger LLM call has asyncio.wait_for timeout.
 """
 
 import functools
 import logging
+import re
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import tenacity
 
 from core.analyzer.file_analyzer import FileAnalyzerAgent
-from core.coder.coder_agent import CoderAgent
+from core.coder.coder_agent import CoderAgent, _parse_columns_from_schema_hints
 from core.debugger.debugger_agent import DebuggerAgent
 from core.executor.code_executor import CodeExecutor, ExecutionResult, mime_for_artifact
 from core.finalizer.finalizer_agent import FinalizerAgent
@@ -123,6 +128,46 @@ async def _with_retry(
 def _ms_since(t0: float) -> int:
     """Returns elapsed milliseconds since ``t0`` (from ``time.monotonic()``)."""
     return int((time.monotonic() - t0) * 1000)
+
+
+def _collect_available_columns(
+    combined: Dict[str, Any],
+    data_description: str,
+) -> List[str]:
+    """Best-effort extraction of available columns from context/description.
+
+    Returns lines in the form ``"<file>: [col1, col2, ...]"``.
+    """
+    hints: List[str] = []
+    for fname, doc in combined.items():
+        if not isinstance(doc, dict):
+            continue
+        metadata = doc.get("metadata", {}) if isinstance(doc.get("metadata"), dict) else {}
+        cols = metadata.get("columns")
+        if not cols and isinstance(metadata.get("sample_rows"), list) and metadata["sample_rows"]:
+            first = metadata["sample_rows"][0]
+            if isinstance(first, dict):
+                cols = list(first.keys())
+        if not cols and isinstance(doc.get("columns"), list):
+            cols = doc.get("columns")
+        if cols:
+            hints.append(f"{fname}: {cols}")
+
+    if hints:
+        return hints
+
+    # Fallback: parse analyzer text — handles BOTH the static format
+    # ("Columns     : [...]") and the LLM-generated script output.
+    # GAP-05 fix: avoids re.DOTALL which crosses file boundaries.
+    if data_description:
+        pattern_cols = re.compile(r"Columns\s*:\s*(\[[^\]]+\])", re.IGNORECASE)
+        for match in pattern_cols.finditer(data_description):
+            cols_str = match.group(1).strip()
+            # Avoid duplicate hint lines for identical schemas
+            if cols_str and not any(cols_str in h for h in hints):
+                hints.append(f"(detected): {cols_str}")
+
+    return hints
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +274,7 @@ class DsStarOrchestrator:
         yield _event("analyzing", message="Analyzing data files…")
         analyzer_t0 = time.monotonic()
         try:
-            data_description = self.analyzer.analyze(combined)
+            data_description = await self.analyzer.analyze(combined, session_id=session_id)
             yield _event(
                 "analysis_complete",
                 message="Data analysis complete.",
@@ -292,6 +337,8 @@ class DsStarOrchestrator:
         }
         rounds_completed = 0
         rounds_until_sufficient = 0
+        consecutive_coder_schema_errors = 0
+        coder_raw_mode_engaged = False  # idempotent guard for force_raw_completion()
 
         for round_num in range(1, self._max_rounds + 1):
             rounds_completed = round_num
@@ -331,6 +378,8 @@ class DsStarOrchestrator:
             _steps = list(plan_steps)
             _prev_code = current_code
             _exec_out = last_exec_result.combined_output()
+            _available_cols = _collect_available_columns(combined, data_description)
+            _schema_hints = "\n".join(_available_cols) if _available_cols else "(unknown)"
 
             try:
                 current_code = await _with_retry(
@@ -341,6 +390,7 @@ class DsStarOrchestrator:
                         _steps,
                         _prev_code,
                         _exec_out,
+                        schema_hints=_schema_hints,
                         token_tracker=token_tracker,
                     ),
                     "CoderAgent",
@@ -349,6 +399,7 @@ class DsStarOrchestrator:
                 for ev in pending_retry_events:
                     yield ev
                 pending_retry_events.clear()
+                consecutive_coder_schema_errors = 0
                 timing.record("coder", _ms_since(coder_t0))
                 yield _event(
                     "code_ready",
@@ -361,14 +412,106 @@ class DsStarOrchestrator:
                     yield ev
                 pending_retry_events.clear()
                 timing.record("coder", _ms_since(coder_t0))
+                exc_str = str(exc)
                 execution_logs.append(
-                    f"[Round {round_num}] Coder exhausted retries: {exc}"
+                    f"[Round {round_num}] Coder exhausted retries: {exc_str}"
                 )
-                yield _event(
-                    "error",
-                    message=f"CoderAgent failed after 3 attempts: {exc}",
+
+                # Fix 3 (P1): Detect schema/column mismatch errors and inject
+                # a diagnostic hint so the error message is actionable.
+                #
+                # Priority 1: if any KNOWN column name from the uploaded data
+                # appears inside the error string, this is always a schema
+                # hallucination error — regardless of wrappers like
+                # "Unknown Error" or "raw completion failed".
+                #
+                # Priority 2: fall back to keyword heuristics for errors that
+                # don't mention a column name but still look schema-related.
+                exc_lower = exc_str.lower()
+
+                # --- Priority 1: column-name presence in error text ---
+                _col_names_lower = {c.lower() for c in _parse_columns_from_schema_hints(_schema_hints)}
+                _found_col = any(
+                    col_name in exc_lower
+                    for col_name in _col_names_lower
+                    if len(col_name) >= 2  # skip single-char column names to avoid false positives
                 )
-                return
+
+                # --- Priority 2: keyword heuristics (legacy path) ---
+                _keyword_match = (
+                    ("not found" in exc_lower and "404" not in exc_lower and "page not found" not in exc_lower)
+                    or "keyerror" in exc_lower
+                    or "column" in exc_lower
+                    or "field" in exc_lower
+                )
+                is_schema_err = _found_col or _keyword_match
+                if is_schema_err:
+                    consecutive_coder_schema_errors += 1
+                    # Append real column names to the next exec_output so the
+                    # Debugger / next Coder round has ground-truth schema context.
+                    _col_hint = (
+                        "\n\nSCHEMA HINT — Available columns from uploaded files:\n"
+                        + _schema_hints
+                    )
+                    last_exec_result = ExecutionResult(
+                        stdout="",
+                        stderr=f"Schema mismatch: {exc_str}{_col_hint}",
+                        returncode=1,
+                    )
+                    yield _event(
+                        "warning",
+                        message=(
+                            f"CoderAgent schema mismatch after 3 attempts: {exc_str}"
+                            f"{_col_hint}"
+                        ),
+                    )
+
+                    # Push the Coder into sticky raw-completion mode so the
+                    # next round skips the brittle structured-output path
+                    # entirely. Idempotent: only fires once per run.
+                    if not coder_raw_mode_engaged:
+                        try:
+                            self.coder.force_raw_completion(
+                                reason=(
+                                    f"schema mismatch round {round_num} "
+                                    f"({exc_str[:80]})"
+                                )
+                            )
+                            coder_raw_mode_engaged = True
+                            yield _event(
+                                "warning",
+                                message=(
+                                    "CoderAgent switched to raw-completion mode "
+                                    "for the rest of this run."
+                                ),
+                            )
+                        except Exception as flip_exc:  # pylint: disable=broad-except
+                            logger.warning(
+                                "[Orchestrator] force_raw_completion failed: %s",
+                                flip_exc,
+                            )
+
+                    # Threshold raised back to 3: now that we correctly detect
+                    # column-name errors inside "Unknown Error" wrappers, the
+                    # first failure triggers force_raw_completion(), the second
+                    # retries with the fresh raw chain, and only the third
+                    # consecutive failure terminates the run.
+                    if consecutive_coder_schema_errors >= 3:
+                        yield _event(
+                            "error",
+                            message=(
+                                "CoderAgent repeatedly failed with schema/tool mismatch. "
+                                "Stopping early to avoid retry loop."
+                            ),
+                        )
+                        return
+                    continue
+                else:
+                    yield _event(
+                        "error",
+                        message=f"CoderAgent failed after 3 attempts: {exc_str}",
+                    )
+                    return
 
             # ── 3b. Code Execution + Debugger Loop ───────────────────────────
             yield _event(
@@ -376,7 +519,6 @@ class DsStarOrchestrator:
                 message=f"Round {round_num}: Executing generated code…",
                 round=round_num,
             )
-            exec_t0 = time.monotonic()  # set before loop for total wall-clock
             debug_attempts = 0
             _code_to_run = current_code
             _total_exec_ms = 0  # ARCH-06: accumulate across all debug-loop iterations
@@ -437,7 +579,11 @@ class DsStarOrchestrator:
                                 traceback=last_exec_result.stderr,
                                 code=_code_to_run,
                                 plan_steps=list(plan_steps),
-                                schema_context=data_description[:2000],
+                                # GAP-03 fix: use structured schema hints (col names) not raw description
+                                schema_context=(
+                                    _schema_hints
+                                    + ("\n\n" + data_description[:1500] if data_description else "")
+                                ),
                                 token_tracker=token_tracker,
                             )
                             _code_to_run = debug_result["corrected_code"]
@@ -575,7 +721,7 @@ class DsStarOrchestrator:
                             _route_query,
                             _route_steps,
                             _route_reason,
-                            _route_exec,
+                            execution_output=_route_exec,   # GAP-01 fix: was positional data_description
                             token_tracker=token_tracker,
                         ),
                         "RouterAgent",
@@ -600,6 +746,52 @@ class DsStarOrchestrator:
                             plan_steps, remove_from, new_step
                         )
                     else:
+                        # GAP-02 fix: ADD_STEP — use sequential PlannerAgent mode
+                        # (rounds 2+) so the new step is grounded in actual
+                        # execution output discovered so far.
+                        # FIX_STEP / REMOVE_STEPS are corrective mutations and
+                        # continue to use the Router-provided step verbatim.
+                        if round_num > 1:
+                            seq_planner_events: List[Dict] = []
+                            try:
+                                _seq_steps = await _with_retry(
+                                    functools.partial(
+                                        self.planner.create_plan,
+                                        query,
+                                        data_description,
+                                        token_tracker=token_tracker,
+                                        execution_output=last_exec_result.combined_output(),
+                                        completed_steps=list(plan_steps),
+                                    ),
+                                    "PlannerAgent(sequential)",
+                                    seq_planner_events,
+                                )
+                                for ev in seq_planner_events:
+                                    yield ev
+                                # Sequential mode returns exactly 1 step;
+                                # wrap it as the new_step for add_step().
+                                if _seq_steps:
+                                    new_step = _seq_steps[0]
+                                    execution_logs.append(
+                                        f"[Round {round_num}] Sequential planner: "
+                                        f"{new_step.get('description', '')[:80]}"
+                                    )
+                                    yield _event(
+                                        "planning",
+                                        message=(
+                                            f"Round {round_num}: Sequential planner "
+                                            f"conditioned next step on execution output."
+                                        ),
+                                        round=round_num,
+                                    )
+                            except Exception as seq_exc:  # pylint: disable=broad-except
+                                logger.warning(
+                                    "[Orchestrator] Sequential planner failed (%s); "
+                                    "using Router's new_step as fallback.",
+                                    seq_exc,
+                                )
+                                for ev in seq_planner_events:
+                                    yield ev
                         plan_steps = self.planner.add_step(plan_steps, new_step)
 
                     execution_logs.append(
@@ -745,7 +937,7 @@ def _build_insights(
     artifact_names = artifact_names or []
     image_artifacts = [
         n for n in artifact_names
-        if n.lower().endswith((".png", ".jpg", ".jpeg", ".svg"))
+        if n.lower().endswith((".png", ".jpg", ".jpeg", ".svg", ".html"))
     ]
 
     # Prefer FinalizerAgent's formatted output when verified

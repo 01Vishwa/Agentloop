@@ -1,5 +1,9 @@
 """DebuggerAgent — dedicated error-isolation and code-repair agent.
 
+GAP-06 fix applied:
+- LLM call now wrapped in ``asyncio.wait_for`` (60 s timeout) so a stalled
+  NIM endpoint cannot freeze the debug loop indefinitely.
+
 Intercepts Python tracebacks after a failed execution round, isolates the
 failing segment, and rewrites only the broken portion rather than regenerating
 the full script from scratch.
@@ -11,13 +15,14 @@ Architecture position:
     Code → Execute → [FAIL] → Debugger → [corrected code] → Execute (retry)
 """
 
+import asyncio
 import logging
-import threading
 from typing import Any, Dict, List, Optional
 
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
+from core.llm_client import get_structured_llm
 from core.token_tracker import TokenTracker, tracker_callback_config
 
 logger = logging.getLogger("uvicorn.info")
@@ -26,6 +31,8 @@ logger = logging.getLogger("uvicorn.info")
 _MAX_TRACEBACK_CHARS = 3_000
 # Maximum chars of code passed to the debugger (keep the full script visible)
 _MAX_CODE_CHARS = 10_000
+# Maximum seconds to wait for the Debugger LLM call before giving up
+_DEBUGGER_LLM_TIMEOUT_S = 60
 
 
 # ---------------------------------------------------------------------------
@@ -131,28 +138,27 @@ class DebuggerAgent:
         self._model = model
         self._temperature = temperature if temperature is not None else 0.1
         self._chain = None
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()  # async-safe lazy init
 
-    def _get_chain(self):
-        """Builds and caches the structured-output LangChain pipeline."""
-        with self._lock:
-            if self._chain is None:
-                from core.llm_client import get_structured_llm  # pylint: disable=import-outside-toplevel
-                from core.config import NIM_MODEL_PRO  # pylint: disable=import-outside-toplevel
-                resolved = self._model or NIM_MODEL_PRO
-                structured_llm = get_structured_llm(
-                    model=resolved,
-                    schema=DebuggerOutput,
-                    temperature=self._temperature,
-                )
-                self._chain = (
-                    ChatPromptTemplate.from_messages([
-                        ("system", _DEBUGGER_SYSTEM),
-                        ("human", _DEBUGGER_HUMAN),
-                    ])
-                    | structured_llm
-                )
-        return self._chain
+    def _build_chain(self):
+        """Builds (but does NOT cache) the LangChain pipeline.
+
+        Heavy work — LLM init, imports — happens here, OUTSIDE the async lock.
+        """
+        from core.config import NIM_MODEL_PRO  # pylint: disable=import-outside-toplevel
+        resolved = self._model or NIM_MODEL_PRO
+        structured_llm = get_structured_llm(
+            model=resolved,
+            schema=DebuggerOutput,
+            temperature=self._temperature,
+        )
+        return (
+            ChatPromptTemplate.from_messages([
+                ("system", _DEBUGGER_SYSTEM),
+                ("human", _DEBUGGER_HUMAN),
+            ])
+            | structured_llm
+        )
 
     async def debug(
         self,
@@ -189,14 +195,26 @@ class DebuggerAgent:
         trimmed_tb = traceback[-_MAX_TRACEBACK_CHARS:]
         trimmed_code = code[-_MAX_CODE_CHARS:]
 
-        result: DebuggerOutput = await self._get_chain().ainvoke(
-            {
-                "traceback": trimmed_tb or "(no traceback — check stderr)",
-                "schema_context": schema_context or "(no schema context available)",
-                "code": trimmed_code,
-                "plan_steps": formatted_steps,
-            },
-            config=tracker_callback_config(token_tracker),
+        if self._chain is None:
+            built = self._build_chain()      # heavy work — no lock held
+            async with self._lock:
+                if self._chain is None:      # double-checked locking
+                    self._chain = built
+        chain = self._chain
+
+        # GAP-06 fix: wrap in asyncio.wait_for so a stalled NIM endpoint
+        # cannot freeze the debug loop indefinitely.
+        result: DebuggerOutput = await asyncio.wait_for(
+            chain.ainvoke(
+                {
+                    "traceback": trimmed_tb or "(no traceback — check stderr)",
+                    "schema_context": schema_context or "(no schema context available)",
+                    "code": trimmed_code,
+                    "plan_steps": formatted_steps,
+                },
+                config=tracker_callback_config(token_tracker),
+            ),
+            timeout=_DEBUGGER_LLM_TIMEOUT_S,
         )
 
         # Strip accidental fences (defensive)

@@ -9,10 +9,12 @@
  * FastAPI auth middleware can verify the Supabase JWT.
  */
 
-import { useState, useCallback, useRef } from 'react'
+import { useState, useCallback, useRef, useEffect } from 'react'
+import { useParams } from 'react-router-dom'
 import { toast } from '../components/shared/Toast'
 import { uploadFiles, processFiles, clearBackendCache } from '../services/api'
 import { useAuth } from '../contexts/AuthContext'
+import { useWorkspaceStore } from '../stores/workspaceStore'
 
 let fileIdCounter = 0
 
@@ -30,6 +32,10 @@ const _generateSessionId = () =>
 /**
  * Manages the full file lifecycle: adding, uploading, replacing duplicates, removing.
  *
+ * Per-project isolation: when a projectId is present in the URL, the sessionId
+ * is derived from it so that every project gets its own backend file-cache bucket.
+ * If the user has not selected a project yet, a random UUID is used as a fallback.
+ *
  * @returns {{ files, pendingDuplicates, sessionId, handleAddFiles, handleConfirmDuplicates, handleRemoveFile, handleClearAll }}
  */
 export function useFileUpload() {
@@ -38,10 +44,15 @@ export function useFileUpload() {
 
   // Auth token for API calls — reads live from AuthContext
   const { getAccessToken } = useAuth()
+  const { activeWorkspace } = useWorkspaceStore()
 
-  // Stable session ID — generated once per component mount, never changes
-  const sessionIdRef = useRef(_generateSessionId())
-  const sessionId = sessionIdRef.current
+  // Derive sessionId from the active projectId so that the backend file-cache
+  // bucket is scoped per project. Falls back to a random UUID when no project
+  // is selected (e.g. on the first render before routing completes).
+  const { projectId } = useParams() ?? {}
+  const fallbackRef = useRef(_generateSessionId())
+  // Prefix with 'proj-' to make it clear this bucket belongs to a project.
+  const sessionId = projectId ? `proj-${projectId}` : fallbackRef.current
 
   const applyProgress = useCallback((id, pct) => {
     setFiles((prev) =>
@@ -49,13 +60,40 @@ export function useFileUpload() {
     )
   }, [])
 
+  const fetchUploadedFiles = useCallback(async () => {
+    if (!activeWorkspace?.id) return
+    const token = getAccessToken()
+    try {
+      const res = await fetch(`/api/files?workspace_id=${activeWorkspace.id}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      if (res.ok) {
+        const data = await res.json()
+        setFiles(data.map((r, i) => ({
+          id: 10000 + i,
+          name: r.filename,
+          size: r.file_size,
+          progress: 100,
+          _raw: null,
+          url: r.file_url
+        })))
+      }
+    } catch (err) {
+      console.error(err)
+    }
+  }, [activeWorkspace?.id, getAccessToken])
+
+  useEffect(() => {
+    fetchUploadedFiles()
+  }, [fetchUploadedFiles])
+
   /** Upload batch → /api/upload then trigger /api/process for accepted files. */
   const startUploads = useCallback(
     async (entriesToUpload) => {
       const token = getAccessToken()
       let uploadResult
       try {
-        uploadResult = await uploadFiles(entriesToUpload, applyProgress, sessionId, token)
+        uploadResult = await uploadFiles(entriesToUpload, applyProgress, sessionId, token, activeWorkspace?.id)
       } catch (err) {
         toast(`Upload error: ${err.message}`, 'error')
         entriesToUpload.forEach((e) => applyProgress(e.id, 0))
@@ -81,7 +119,7 @@ export function useFileUpload() {
         }
       }
     },
-    [applyProgress, getAccessToken, sessionId]
+    [applyProgress, getAccessToken, sessionId, activeWorkspace?.id]
   )
 
   const handleAddFiles = useCallback(

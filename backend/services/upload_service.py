@@ -28,6 +28,8 @@ _FILE_CACHE: Dict[str, Dict[str, bytes]] = {}
 async def save_upload_file(
     file: UploadFile,
     session_id: str = _ANON_SESSION,
+    user_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
 ) -> Tuple[int, str]:
     """Streams a single UploadFile into the session-scoped cache.
 
@@ -55,13 +57,36 @@ async def save_upload_file(
         content_chunks.append(chunk)
 
     # Store in the session bucket — never touching other sessions
-    _FILE_CACHE.setdefault(session_id, {})[file.filename] = b"".join(content_chunks)
+    content = b"".join(content_chunks)
+    _FILE_CACHE.setdefault(session_id, {})[file.filename] = content
 
     file_format = (
         file.filename.rsplit(".", 1)[-1].lower()
         if file.filename and "." in file.filename
         else "unknown"
     )
+
+    if workspace_id:
+        try:
+            from services.supabase_service import upload_to_storage, insert_file_record
+            public_url, storage_path = await upload_to_storage(
+                filename=file.filename,
+                content_bytes=content,
+                extension=file_format
+            )
+            record = {
+                "filename": file.filename,
+                "file_path": storage_path,
+                "file_url": public_url,
+                "file_size": bytes_read,
+                "extension": file_format,
+                "workspace_id": workspace_id,
+                "user_id": user_id,
+            }
+            await insert_file_record(record)
+        except Exception as e:
+            logger.warning("Failed to persist file %s to Supabase: %s", file.filename, e)
+
     logger.info(
         "Uploaded File Metadata - Name: %s, Format: %s, Session: %s",
         file.filename,
