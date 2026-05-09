@@ -24,8 +24,9 @@ Agentloop is a multi-agent AI platform built for Intelligent Document Processing
 - **Autonomous Agent Loop**: Plan → Code → Execute → Verify → Route.
 - **Deep Research Mode (DS-STAR+)**: Decompose → Parallelize → Synthesize for open-ended queries.
 - **Supabase JWT Authentication**: Secure sign-up/sign-in; every API call is auth-gated.
-- **Workspace Management**: Organize runs into user-owned workspaces with RLS-enforced isolation.
-- **Secure Sandboxing**: Executes AI-generated code in isolated subprocesses (Docker-ready).
+- **Workspace Management**: Organize runs and file uploads into user-owned workspaces with RLS-enforced isolation.
+- **Secure Sandboxing**: Executes AI-generated code in isolated subprocesses (Docker-ready, fully supports `matplotlib` data visualization).
+- **Hardened Orchestration**: Fully asynchronous, deadlock-free (`asyncio.Lock`) execution loop with dynamic schema metadata injection to prevent hallucination.
 - **Real-Time Streaming**: Live agent states and execution artifacts via Server-Sent Events (SSE).
 - **Persistent Analytics**: Run history, metrics, and observability via Supabase PostgreSQL.
 - **Modern UI**: Glassmorphism design on React 19 + Tailwind CSS; workspace selector, auth modal.
@@ -98,9 +99,9 @@ flowchart TD
 |---|---|
 | **Frontend** | React 19, Vite, Tailwind CSS, Lucide React |
 | **State / Auth** | Zustand, `@supabase/supabase-js` |
-| **Backend** | FastAPI, Python 3.10+, PyJWT, Tenacity |
-| **AI / LLM** | LangChain, NVIDIA NIM |
-| **Execution** | Subprocess sandbox (Docker-ready) |
+| **Backend** | FastAPI, Python 3.10+, PyJWT, Tenacity, asyncio |
+| **AI / LLM** | LangChain, `langchain-nvidia-ai-endpoints` (NVIDIA NIM) |
+| **Execution** | Subprocess sandbox (Docker-ready, Data Science env equipped) |
 | **Database / Auth** | Supabase (PostgreSQL + Row-Level Security) |
 
 ---
@@ -115,10 +116,13 @@ Agentloop/
 │   │   └── routes.py          # FastAPI router — thin endpoint declarations
 │   ├── core/                  # DS-STAR Orchestrator, Planner, Coder, Verifier…
 │   ├── db/
-│   │   ├── create_workspaces.sql      # Workspaces table + RLS
-│   │   ├── create_agent_runs.sql      # Agent runs table + RLS
-│   │   ├── create_reports_schema.sql  # Reports + sub_questions tables + RLS
-│   │   └── create_eval_schema.sql     # Evaluation metrics schema
+│   │   ├── create_workspaces.sql              # Workspaces table + RLS
+│   │   ├── create_uploaded_files.sql          # File metadata table + RLS
+│   │   ├── add_workspace_to_uploaded_files.sql # File workspace scoping migration
+│   │   ├── create_agent_runs.sql              # Agent runs table + RLS
+│   │   ├── create_reports_schema.sql          # Reports + sub_questions tables + RLS
+│   │   ├── create_eval_schema.sql             # Evaluation metrics schema
+│   │   └── add_eval_metrics_fk.sql            # Add eval metrics foreign keys
 │   ├── eval/                  # Evaluation framework and metrics
 │   ├── middleware/
 │   │   ├── auth.py            # JWT dependency (get_current_user / get_optional_user)
@@ -235,11 +239,14 @@ cd Agentloop
 
 1. Create a project at [supabase.com](https://supabase.com).
 2. Open the **SQL Editor** and run these migration files **in order**:
-   ```
+   ```text
    backend/db/create_workspaces.sql
+   backend/db/create_uploaded_files.sql
+   backend/db/add_workspace_to_uploaded_files.sql
    backend/db/create_agent_runs.sql
    backend/db/create_reports_schema.sql
    backend/db/create_eval_schema.sql
+   backend/db/add_eval_metrics_fk.sql
    ```
 3. From **Settings → API**, collect:
    - `Project URL` → `SUPABASE_URL` / `VITE_SUPABASE_URL`
