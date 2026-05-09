@@ -10,7 +10,8 @@ Security fixes applied:
 - File cache accessed via session-scoped ``get_session_files()`` — no global
   singleton reads, preventing cross-user file leakage (Gap 1 fix).
 - Optional Docker sandbox path controlled by DOCKER_SANDBOX_ENABLED env flag
-  (Gap 2 fix).  Falls back gracefully to subprocess when Docker is unavailable.
+  (Gap 2 fix).  FAIL-CLOSED: raises RuntimeError when Docker is enabled but
+  unavailable — no subprocess fallback is permitted in production.
 
 Artifact MIME types extended to cover image formats and ML model files.
 """
@@ -22,7 +23,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from core.config import (
     DOCKER_CPU_QUOTA,
@@ -143,8 +144,9 @@ class CodeExecutor:
 
     When ``DOCKER_SANDBOX_ENABLED=true`` the code is executed inside a Docker
     container with ``--network none`` and memory/CPU caps, providing stronger
-    isolation than a bare subprocess.  Falls back to subprocess automatically
-    if Docker is unavailable.
+    isolation than a bare subprocess.  FAIL-CLOSED: if Docker is enabled but
+    the SDK is missing or the daemon is unreachable, a ``RuntimeError`` is
+    raised immediately — no subprocess fallback is permitted.
 
     The execution body runs via ``asyncio.run_in_executor`` so it never blocks
     the FastAPI event loop.
@@ -165,7 +167,7 @@ class CodeExecutor:
         Returns:
             ExecutionResult with captured outputs and any artifacts.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         if DOCKER_SANDBOX_ENABLED:
             result = await loop.run_in_executor(
                 None, self._run_in_docker, code, session_id
@@ -311,22 +313,21 @@ class CodeExecutor:
         """
         try:
             import docker  # pylint: disable=import-outside-toplevel
-        except ImportError:
-            logger.warning(
-                "[Executor] docker SDK not installed — falling back to subprocess. "
-                "Run: pip install docker"
-            )
-            return self._run_sync(code, session_id=session_id)
+        except ImportError as exc:
+            raise RuntimeError(
+                "[Executor] FAIL-CLOSED: docker SDK not installed but "
+                "DOCKER_SANDBOX_ENABLED=true. Run: pip install docker"
+            ) from exc
 
         from services.upload_service import get_session_files  # pylint: disable=import-outside-toplevel
 
         try:
             client = docker.from_env(timeout=10)
         except Exception as exc:  # pylint: disable=broad-except
-            logger.warning(
-                "[Executor] Docker unavailable (%s) — falling back to subprocess.", exc
-            )
-            return self._run_sync(code, session_id=session_id)
+            raise RuntimeError(
+                f"[Executor] FAIL-CLOSED: Docker daemon unreachable ({exc}). "
+                "Ensure Docker is running or set DOCKER_SANDBOX_ENABLED=false for local dev."
+            ) from exc
 
         with tempfile.TemporaryDirectory() as tmpdir:
             outputs_dir = os.path.join(tmpdir, "outputs")
@@ -421,8 +422,10 @@ def _collect_artifacts(base_dir: str, exclude_files: set) -> Dict[str, str]:
                 continue
             try:
                 with open(fpath, "rb") as fh:
-                    # normalise path separators for the frontend
-                    safe_name = relpath.replace(os.sep, "/")
+                    # Most callers expect artifact keys to be just the filename
+                    # (not "outputs/<name>"). Normalize to basename while keeping
+                    # path separators out of the key.
+                    safe_name = os.path.basename(relpath).replace(os.sep, "/")
                     artifacts[safe_name] = base64.b64encode(fh.read()).decode("utf-8")
                 logger.info("[Executor] Collected artifact: %s", safe_name)
             except Exception as exc:  # pylint: disable=broad-except

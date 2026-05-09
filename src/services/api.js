@@ -57,47 +57,60 @@ async function _request(url, accessToken, method = 'GET') {
  * @param {string|null} [accessToken=null]      - JWT for Authorization header.
  * @returns {Promise<{ accepted_files: object[], rejected_files: object[] }>}
  */
-export async function uploadFiles(files, onProgress, sessionId = '', accessToken = null) {
+export async function uploadFiles(files, onProgress, sessionId = '', accessToken = null, workspaceId = null) {
   const formData = new FormData()
   files.forEach((file) => formData.append('files', file._raw, file.name))
 
-  const progressIntervals = files.map((file) => {
-    let pct = 0
-    const interval = setInterval(() => {
-      pct = Math.min(pct + 10, 90)
-      onProgress(file.id, pct)
-    }, 150)
-    return { id: file.id, interval }
-  })
+  let url = `${BASE}/upload`
+  const params = new URLSearchParams()
+  if (sessionId) params.append('session_id', sessionId)
+  if (workspaceId) params.append('workspace_id', workspaceId)
+  if (params.toString()) url += '?' + params.toString()
 
-  const url = sessionId
-    ? `${BASE}/upload?session_id=${encodeURIComponent(sessionId)}`
-    : `${BASE}/upload`
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', url)
 
-  let data
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { ...authHeader(accessToken) },
-      body: formData,
-    })
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ message: `HTTP ${res.status}` }))
-      throw new Error(err.message || `Upload failed with status ${res.status}`)
+    const headers = authHeader(accessToken)
+    for (const [key, value] of Object.entries(headers)) {
+      xhr.setRequestHeader(key, value)
     }
-    data = await res.json()
-  } finally {
-    progressIntervals.forEach(({ id, interval }) => {
-      clearInterval(interval)
-      const rejected = data?.rejected_files?.some((f) => {
-        const entry = files.find((f2) => f2.id === id)
-        return entry && f.filename === entry.name
-      })
-      onProgress(id, rejected ? -1 : 100)
-    })
-  }
 
-  return data
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        const pct = Math.round((event.loaded / event.total) * 100)
+        files.forEach((file) => onProgress(file.id, pct === 100 ? 99 : pct))
+      }
+    }
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const data = JSON.parse(xhr.responseText)
+          files.forEach((file) => {
+            const rejected = data?.rejected_files?.some((f) => f.filename === file.name)
+            onProgress(file.id, rejected ? -1 : 100)
+          })
+          resolve(data)
+        } catch (err) {
+          reject(new Error('Invalid JSON response'))
+        }
+      } else {
+        try {
+          const errData = JSON.parse(xhr.responseText)
+          reject(new Error(errData.message || `Upload failed with status ${xhr.status}`))
+        } catch (e) {
+          reject(new Error(`Upload failed with status ${xhr.status}`))
+        }
+      }
+    }
+
+    xhr.onerror = () => {
+      reject(new Error('Network error during upload'))
+    }
+
+    xhr.send(formData)
+  })
 }
 
 // ---------------------------------------------------------------------------

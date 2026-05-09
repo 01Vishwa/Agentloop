@@ -18,6 +18,7 @@ async def handle_upload(
     files: List[UploadFile],
     session_id: str = "__anon__",
     user_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
 ) -> UploadResponse:
     """Orchestrates validation and persistence for a batch of uploaded files.
 
@@ -46,7 +47,7 @@ async def handle_upload(
             continue
 
         try:
-            await save_upload_file(file, session_id=session_id)
+            await save_upload_file(file, session_id=session_id, user_id=user_id, workspace_id=workspace_id)
             accepted.append(
                 FileStatusItem(
                     filename=file.filename,

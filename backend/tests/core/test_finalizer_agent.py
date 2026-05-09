@@ -46,3 +46,24 @@ async def test_finalizer_agent_formats_output_correctly():
         call_args = mock_chain.ainvoke.call_args[0][0]
         assert call_args["query"] == "What was the Q3 revenue growth?"
         assert call_args["artifacts"] == "chart.png"
+
+
+@pytest.mark.asyncio
+async def test_finalizer_column_listing_uses_deterministic_format():
+    """Column-listing queries should preserve exact column names from stdout."""
+    agent = FinalizerAgent()
+    agent._chain = AsyncMock()  # should not be used for this deterministic branch
+
+    result = await agent.finalize(
+        query="list down all columns here in this file",
+        execution_output="healthcare_dataset.csv: ['Name', 'Age', 'Gender']",
+        plan_steps=[{"index": 0, "description": "Print columns"}],
+        artifact_names=[],
+    )
+
+    assert "Detected 3 column(s)" in result["headline"]
+    assert "`healthcare_dataset.csv`" in result["formatted_output"]
+    assert "`Name`" in result["formatted_output"]
+    assert "`Age`" in result["formatted_output"]
+    assert result["confidence"] == 1.0
+    agent._chain.ainvoke.assert_not_called()

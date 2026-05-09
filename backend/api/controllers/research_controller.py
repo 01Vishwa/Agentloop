@@ -62,7 +62,7 @@ def _get_research_orchestrator(
     Returns:
         A ready-to-use DeepResearchOrchestrator instance.
     """
-    from core.config import MAX_AGENT_ROUNDS  # pylint: disable=import-outside-toplevel
+    from core.config import DS_STAR_PLUS_MAX_ROUNDS  # pylint: disable=import-outside-toplevel
     cache_key: _ResearchOrchestratorKey = (model, coder_model, temperature, max_workers)
     if cache_key not in _research_orchestrator_cache:
         _research_orchestrator_cache[cache_key] = DeepResearchOrchestrator(
@@ -77,7 +77,7 @@ def _get_research_orchestrator(
             model, max_workers,
         )
     orchestrator = _research_orchestrator_cache[cache_key]
-    orchestrator._max_rounds = max_rounds or MAX_AGENT_ROUNDS
+    orchestrator._max_rounds = max_rounds or DS_STAR_PLUS_MAX_ROUNDS
     return orchestrator
 
 
@@ -123,7 +123,7 @@ async def handle_research_run(
     )
 
     # Persist report row before streaming starts
-    await _try_create_report(report_id, _session_id, query, context, workspace_id)
+    await _try_create_report(report_id, _session_id, query, context, workspace_id, user_id)
 
     # Emit report_id to frontend immediately
     yield f"data: {json.dumps({'event': 'report_started', 'payload': {'report_id': report_id}})}\n\n"
@@ -146,12 +146,33 @@ async def handle_research_run(
                 await _try_create_subquestions(report_id, sub_questions)
                 sub_questions_created = True
 
+            elif event_type == "subquestion_started":
+                sub_run_id = event_payload.get("sub_run_id")
+                question = event_payload.get("question")
+                if sub_run_id and question:
+                    await _try_create_run(
+                        run_id=sub_run_id,
+                        session_id=_session_id,
+                        query=question,
+                        context=context,
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                    )
+
             elif event_type == "subquestion_complete":
+                sub_run_id = event_payload.get("sub_run_id", "")
+                # 1. Update the sub-run's agent_runs row
+                await _try_update_run(
+                    run_id=sub_run_id,
+                    payload=event_payload.get("result", {}),
+                    status=event_payload.get("status", "completed"),
+                )
+                # 2. Link it safely in sub_questions
                 await _try_update_subquestion(
                     report_id=report_id,
                     index=event_payload.get("index", 0),
                     status=event_payload.get("status", "completed"),
-                    result_run_id=event_payload.get("sub_run_id", ""),
+                    result_run_id=sub_run_id,
                 )
 
             elif event_type == "research_complete":
@@ -191,6 +212,7 @@ async def _try_create_report(
     query: str,
     context: Dict[str, Any],
     workspace_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> None:
     """Creates a new reports row with status=running."""
     try:
@@ -202,6 +224,7 @@ async def _try_create_report(
             file_names=file_names,
             session_id=session_id,
             workspace_id=workspace_id,
+            user_id=user_id,
         )
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning(
@@ -279,3 +302,48 @@ async def _try_fail_report(report_id: str) -> None:
         logger.warning(
             "[ResearchController] Could not mark report as failed: %s", exc
         )
+
+
+async def _try_create_run(
+    run_id: str,
+    session_id: str,
+    query: str,
+    context: Dict[str, Any],
+    workspace_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> None:
+    """Attempts to create an agent_runs row in Supabase."""
+    try:
+        from services.supabase_service import create_agent_run  # pylint: disable=import-outside-toplevel
+        file_names = list(context.get("combined_extractions", {}).keys())
+        await create_agent_run(
+            run_id=run_id,
+            session_id=session_id,
+            query=query,
+            file_names=file_names,
+            workspace_id=workspace_id,
+            user_id=user_id,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("[ResearchController] Could not persist run start: %s", exc)
+
+
+async def _try_update_run(
+    run_id: str,
+    payload: Dict[str, Any],
+    status: str = "completed",
+) -> None:
+    """Attempts to update the agent_runs row with the final result."""
+    try:
+        from services.supabase_service import update_agent_run  # pylint: disable=import-outside-toplevel
+        await update_agent_run(
+            run_id=run_id,
+            plan_steps=payload.get("plan_steps", []),
+            final_code=payload.get("code", {}).get("Python", "") if isinstance(payload.get("code"), dict) else payload.get("code", ""),
+            rounds=payload.get("rounds", 0),
+            insights=payload.get("insights", {}),
+            execution_logs=payload.get("execution_logs", []),
+            status=status,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("[ResearchController] Could not persist run result: %s", exc)

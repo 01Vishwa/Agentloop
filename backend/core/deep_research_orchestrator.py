@@ -22,11 +22,11 @@ import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from core.analyzer.file_analyzer import FileAnalyzerAgent
-from core.ds_star_orchestrator import DsStarOrchestrator, _event, _ms_since
+from core.ds_star_orchestrator import DsStarOrchestrator, _event
 from core.ds_star_plus.subquestion_agent import SubQuestionGeneratorAgent
 from core.ds_star_plus.report_writer_agent import ReportWriterAgent
 from core.retrieval.retriever import Retriever
-from core.config import DS_STAR_PLUS_MAX_WORKERS, MAX_AGENT_ROUNDS
+from core.config import DS_STAR_PLUS_MAX_WORKERS, DS_STAR_PLUS_MAX_ROUNDS
 
 logger = logging.getLogger("uvicorn.info")
 
@@ -120,6 +120,8 @@ async def _run_single_ds_star(
                 result["insights"] = payload.get("insights", {})
                 result["code"] = payload.get("code", {}).get("Python", "")
                 result["rounds"] = payload.get("rounds", 0)
+                result["plan_steps"] = payload.get("plan_steps", [])
+                result["execution_logs"] = payload.get("execution_logs", [])
                 exec_out = payload.get("insights", {}).get("summary", "")
                 result["execution_output"] = exec_out
             elif event_type == "execution_result":
@@ -181,7 +183,7 @@ class DeepResearchOrchestrator:
             temperature: LLM sampling temperature.
             max_workers: Maximum parallel DS-STAR sub-executions.
         """
-        self._max_rounds = max_rounds or MAX_AGENT_ROUNDS
+        self._max_rounds = max_rounds or DS_STAR_PLUS_MAX_ROUNDS
         self._model = model
         self._coder_model = coder_model
         self._temperature = temperature
@@ -225,7 +227,7 @@ class DeepResearchOrchestrator:
         # ── Stage 1: File Analysis ────────────────────────────────────────────
         yield _event("analyzing", message="Analyzing data files for research context…")
         try:
-            data_description = self.analyzer.analyze(combined)
+            data_description = await self.analyzer.analyze(combined, session_id=session_id)
             yield _event(
                 "analysis_complete",
                 message="Data analysis complete.",
@@ -346,6 +348,7 @@ class DeepResearchOrchestrator:
                 index=idx,
                 status=sub_result["status"],
                 sub_run_id=sub_result["run_id"],
+                result=sub_result,
             )
 
         yield _event(
@@ -354,39 +357,148 @@ class DeepResearchOrchestrator:
             statuses=[r["status"] for r in results],
         )
 
-        # ── Stage 4: Report Writing ───────────────────────────────────────────
-        yield _event("writing_report", message="Synthesising research report…")
+        # ── Stage 4: Initial Report Writing ──────────────────────────────────
+        yield _event("writing_report", message="Synthesising initial research report…")
+        initial_report: dict = {}
         try:
-            report = await self.report_writer.write(
+            initial_report = await self.report_writer.write(
                 query=query,
                 sub_questions=sub_questions,
                 results=results,
             )
-            total_ms = int((time.monotonic() - run_t0) * 1000)
             yield _event(
-                "research_complete",
-                message="DS-STAR+ research report ready.",
-                report_id=report_id,
-                title=report.get("title", ""),
-                executive_summary=report.get("executive_summary", ""),
-                report_body=report.get("report_body", ""),
-                key_findings=report.get("key_findings", []),
-                caveats=report.get("caveats", []),
-                sub_questions=sub_questions,
-                sub_run_ids=sub_run_ids,
-                total_ms=total_ms,
+                "initial_report_ready",
+                message="Initial report drafted — starting refinement round…",
+                title=initial_report.get("title", ""),
+                key_findings_count=len(initial_report.get("key_findings", [])),
             )
             logger.info(
-                "[DeepResearch] report_id=%s complete | %d findings | %d caveats | %dms",
+                "[DeepResearch] report_id=%s | Initial report ready — %d findings",
                 report_id,
-                len(report.get("key_findings", [])),
-                len(report.get("caveats", [])),
-                total_ms,
+                len(initial_report.get("key_findings", [])),
             )
         except Exception as exc:  # pylint: disable=broad-except
-            yield _event("error", message=f"ReportWriter failed: {exc}")
-            logger.error(
-                "[DeepResearch] report_id=%s | ReportWriter error: %s",
-                report_id,
-                exc,
+            yield _event("error", message=f"Initial ReportWriter failed: {exc}")
+            logger.error("[DeepResearch] report_id=%s | Initial write error: %s", report_id, exc)
+            return
+
+        # ── Stage 5: Iterative Refinement (DS-STAR+ paper §2) ────────────────
+        # Re-engage SubQuestion generator with the draft to identify gaps,
+        # run supplementary DS-STAR analyses, then call the writer in
+        # refinement mode to integrate the new evidence into the final report.
+        final_report = initial_report
+        draft_body = initial_report.get("report_body", "")
+
+        yield _event(
+            "refining_report",
+            message="Identifying informational gaps for iterative refinement…",
+        )
+        try:
+            supplementary_questions: List[str] = await self.subq_agent.generate(
+                query=query,
+                data_summary=data_description,
+                draft_report=draft_body,
             )
+
+            if supplementary_questions:
+                yield _event(
+                    "supplementary_subquestions_ready",
+                    message=(
+                        f"Generated {len(supplementary_questions)} supplementary "
+                        f"questions to fill gaps."
+                    ),
+                    sub_questions=supplementary_questions,
+                    count=len(supplementary_questions),
+                )
+                logger.info(
+                    "[DeepResearch] report_id=%s | %d supplementary questions",
+                    report_id,
+                    len(supplementary_questions),
+                )
+
+                # Run supplementary DS-STAR analyses (semaphore-controlled)
+                sup_run_ids = [uuid.uuid4().hex for _ in supplementary_questions]
+                sup_semaphore = asyncio.Semaphore(self._max_workers)
+
+                async def _sup_run(i: int, question: str) -> Dict[str, Any]:
+                    async with sup_semaphore:
+                        return await _run_single_ds_star(
+                            question=question,
+                            context=context,
+                            model=self._model,
+                            coder_model=self._coder_model,
+                            temperature=self._temperature,
+                            max_rounds=self._max_rounds,
+                            sub_run_id=sup_run_ids[i],
+                            session_id=session_id,
+                        )
+
+                sup_tasks = [
+                    asyncio.create_task(_sup_run(i, q))
+                    for i, q in enumerate(supplementary_questions)
+                ]
+                supplementary_results: List[Dict[str, Any]] = [None] * len(supplementary_questions)  # type: ignore[assignment]
+                for coro in asyncio.as_completed(sup_tasks):
+                    sup_result = await coro
+                    idx = sup_run_ids.index(sup_result["run_id"])
+                    supplementary_results[idx] = sup_result
+                    yield _event(
+                        "supplementary_subquestion_complete",
+                        message=f"[Supplementary Q{idx + 1}] done — status: {sup_result['status']}",
+                        index=idx,
+                        status=sup_result["status"],
+                    )
+
+                # Refine the report by integrating supplementary evidence
+                yield _event("writing_report", message="Integrating supplementary evidence into final report…")
+                final_report = await self.report_writer.write(
+                    query=query,
+                    sub_questions=sub_questions,
+                    results=results,
+                    draft_report=draft_body,
+                    supplementary_questions=supplementary_questions,
+                    supplementary_results=supplementary_results,
+                )
+                logger.info(
+                    "[DeepResearch] report_id=%s | Refinement complete — %d findings",
+                    report_id,
+                    len(final_report.get("key_findings", [])),
+                )
+            else:
+                logger.info(
+                    "[DeepResearch] report_id=%s | No supplementary questions generated — skipping refinement.",
+                    report_id,
+                )
+
+        except Exception as ref_exc:  # pylint: disable=broad-except
+            # Refinement failure is non-fatal — fall back to initial report
+            logger.warning(
+                "[DeepResearch] report_id=%s | Refinement error (using initial report): %s",
+                report_id,
+                ref_exc,
+            )
+            yield _event("warning", message=f"Refinement skipped (non-fatal): {ref_exc}")
+            final_report = initial_report
+
+        # ── Stage 6: Emit final report ────────────────────────────────────────
+        total_ms = int((time.monotonic() - run_t0) * 1000)
+        yield _event(
+            "research_complete",
+            message="DS-STAR+ research report ready.",
+            report_id=report_id,
+            title=final_report.get("title", ""),
+            executive_summary=final_report.get("executive_summary", ""),
+            report_body=final_report.get("report_body", ""),
+            key_findings=final_report.get("key_findings", []),
+            caveats=final_report.get("caveats", []),
+            sub_questions=sub_questions,
+            sub_run_ids=sub_run_ids,
+            total_ms=total_ms,
+        )
+        logger.info(
+            "[DeepResearch] report_id=%s complete | %d findings | %d caveats | %dms",
+            report_id,
+            len(final_report.get("key_findings", [])),
+            len(final_report.get("caveats", [])),
+            total_ms,
+        )

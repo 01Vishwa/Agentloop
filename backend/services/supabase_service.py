@@ -21,36 +21,87 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from supabase import create_client, Client
 
-from core.config import SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, SUPABASE_BUCKET
+from core.config import SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, SUPABASE_BUCKET, SUPABASE_SERVICE_ROLE_KEY
 
 logger = logging.getLogger("uvicorn.info")
 
 # ---------------------------------------------------------------------------
-# Singleton client
+# Circuit-breaker — set to True on the first Supabase 401 so that every
+# subsequent call fails silently instead of spamming the log on every poll.
+# Reset by restarting the server (after fixing .env).
+# ---------------------------------------------------------------------------
+_supabase_auth_failed: bool = False
+
+# ---------------------------------------------------------------------------
+# Client factories — create a fresh client inside each executor thread.
+#
+# supabase-py v2 uses httpx.Client internally. A client initialised in the
+# main async event-loop thread holds sockets in non-blocking mode. Reusing
+# that singleton from a ThreadPoolExecutor thread causes Windows to raise
+# WinError 10035 (WSAEWOULDBLOCK). Creating a new client per _sync() call
+# is cheap (just HTTP headers + URL) and is the safe cross-thread pattern.
+# ---------------------------------------------------------------------------
+
+def _make_anon_client() -> Client:
+    """Creates a fresh Supabase anon client for use in executor threads."""
+    if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
+        raise RuntimeError(
+            "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY must be set in .env"
+        )
+    return create_client(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
+
+
+def _make_service_client() -> Client:
+    """Creates a fresh Supabase service-role client for use in executor threads.
+
+    Falls back to the anon client if SUPABASE_SERVICE_ROLE_KEY is missing,
+    logging a warning since writes will then fail RLS.
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        logger.warning(
+            "[Supabase] SUPABASE_SERVICE_ROLE_KEY missing; "
+            "falling back to anon client (writes may fail RLS)"
+        )
+        return _make_anon_client()
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+
+# ---------------------------------------------------------------------------
+# Legacy accessors kept for any callers outside _sync() closures.
+# These are NOT used inside run_in_executor threads.
 # ---------------------------------------------------------------------------
 
 _client: Optional[Client] = None
+_service_client: Optional[Client] = None
 
 
 def get_supabase_client() -> Client:
-    """Returns a cached Supabase client, initialising it on first call.
+    """Returns a cached Supabase anon client (main-thread use only).
+
+    WARNING: Do NOT pass this instance into a ThreadPoolExecutor. Use
+    ``_make_anon_client()`` inside ``_sync()`` closures instead.
 
     Returns:
-        Client: Authenticated Supabase client instance.
-
-    Raises:
-        RuntimeError: If SUPABASE_URL or SUPABASE_PUBLISHABLE_KEY are missing.
+        Client: Anon Supabase client instance.
     """
     global _client
     if _client is None:
-        if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
-            raise RuntimeError(
-                "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY must be set in .env"
-            )
-        _client = create_client(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
-        logger.info("Supabase client initialised (url=%s)", SUPABASE_URL)
+        _client = _make_anon_client()
+        logger.info("Supabase anon client initialised")
     return _client
 
+
+def get_service_role_client() -> Client:
+    """Returns a cached Supabase service-role client (main-thread use only).
+
+    WARNING: Do NOT pass this instance into a ThreadPoolExecutor. Use
+    ``_make_service_client()`` inside ``_sync()`` closures instead.
+    """
+    global _service_client
+    if _service_client is None:
+        _service_client = _make_service_client()
+        logger.info("Supabase service-role client initialised")
+    return _service_client
 
 # ---------------------------------------------------------------------------
 # Storage operations
@@ -86,7 +137,7 @@ async def upload_to_storage(
     storage_path = f"{uuid.uuid4().hex}/{filename}"
 
     def _sync() -> Tuple[str, str]:
-        client = get_supabase_client()
+        client = _make_service_client()
         response = client.storage.from_(SUPABASE_BUCKET).upload(
             path=storage_path,
             file=content_bytes,
@@ -120,7 +171,7 @@ async def insert_file_record(record: Dict[str, Any]) -> Dict[str, Any]:
         RuntimeError: If the insert fails.
     """
     def _sync() -> Dict[str, Any]:
-        client = get_supabase_client()
+        client = _make_service_client()
         response = (
             client.table("uploaded_files")
             .insert(record)
@@ -134,20 +185,18 @@ async def insert_file_record(record: Dict[str, Any]) -> Dict[str, Any]:
     return await asyncio.get_running_loop().run_in_executor(None, _sync)
 
 
-async def list_uploaded_files() -> List[Dict[str, Any]]:
+async def list_uploaded_files(workspace_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Fetches all rows from the ``uploaded_files`` table.
 
     Returns:
         List[Dict[str, Any]]: List of dataset metadata rows.
     """
     def _sync() -> List[Dict[str, Any]]:
-        client = get_supabase_client()
-        response = (
-            client.table("uploaded_files")
-            .select("*")
-            .order("created_at", desc=True)
-            .execute()
-        )
+        client = _make_anon_client()
+        query = client.table("uploaded_files").select("*").order("created_at", desc=True)
+        if workspace_id:
+            query = query.eq("workspace_id", workspace_id)
+        response = query.execute()
         return response.data or []
 
     return await asyncio.get_running_loop().run_in_executor(None, _sync)
@@ -182,7 +231,7 @@ async def create_agent_run(
         RuntimeError: If the DB insert fails.
     """
     def _sync() -> Dict[str, Any]:
-        client = get_supabase_client()
+        client = _make_service_client()
         record = {
             "id": run_id,
             "session_id": session_id or None,
@@ -231,7 +280,7 @@ async def update_agent_run(
         Dict[str, Any]: The updated row.
     """
     def _sync() -> Dict[str, Any]:
-        client = get_supabase_client()
+        client = _make_service_client()
         updates = {
             "plan_steps": plan_steps,
             "final_code": final_code,
@@ -267,7 +316,7 @@ async def get_agent_run(run_id: str) -> Dict[str, Any]:
         Dict[str, Any]: The run row, or an empty dict if not found.
     """
     def _sync() -> Dict[str, Any]:
-        client = get_supabase_client()
+        client = _make_service_client()
         try:
             response = (
                 client.table("agent_runs")
@@ -302,7 +351,10 @@ async def list_agent_runs(
         List[Dict[str, Any]]: Agent run rows ordered newest first.
     """
     def _sync() -> List[Dict[str, Any]]:
-        client = get_supabase_client()
+        global _supabase_auth_failed  # pylint: disable=global-statement
+        if _supabase_auth_failed:
+            return []  # Circuit open — skip silently until server restart
+        client = _make_service_client()
         try:
             query = (
                 client.table("agent_runs")
@@ -317,7 +369,15 @@ async def list_agent_runs(
             response = query.execute()
             return response.data or []
         except Exception as exc:  # pylint: disable=broad-except
-            logger.warning("Could not list agent_runs (schema missing?): %s", exc)
+            exc_str = str(exc)
+            if "401" in exc_str or "Invalid API key" in exc_str:
+                _supabase_auth_failed = True
+                logger.error(
+                    "[Supabase] Auth failed — disabling DB calls until restart. "
+                    "Fix SUPABASE_SERVICE_ROLE_KEY in backend/.env"
+                )
+            else:
+                logger.warning("Could not list agent_runs (schema missing?): %s", exc)
             return []
 
     return await asyncio.get_running_loop().run_in_executor(None, _sync)
@@ -341,7 +401,7 @@ async def update_agent_run_metrics(
         Dict[str, Any]: The updated row, or empty dict on failure.
     """
     def _sync() -> Dict[str, Any]:
-        client = get_supabase_client()
+        client = _make_service_client()
         updates = {
             "eval_metrics": {
                 **metrics,
@@ -383,6 +443,8 @@ async def create_report_run(
     query: str,
     file_names: List[str],
     session_id: str = "",
+    workspace_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Creates a new tracking row in the reports table.
 
@@ -391,16 +453,20 @@ async def create_report_run(
         query: Full natural language query.
         file_names: List of files included in the context.
         session_id: Optional client session ID.
+        workspace_id: Optional workspace UUID to associate this report.
+        user_id: Optional authenticated user UUID.
 
     Returns:
         The inserted row as a dictionary.
     """
     def _sync() -> Dict[str, Any]:
-        client = get_supabase_client()
+        client = _make_service_client()
         record = {
             "id": report_id,
             "query": query,
             "session_id": session_id or None,
+            "workspace_id": workspace_id or None,
+            "user_id": user_id or None,
             "file_names": file_names,
             "status": "running",
             "key_findings": [],
@@ -430,7 +496,7 @@ async def create_subquestions(
         sub_questions: Ordered list of sub-questions to track.
     """
     def _sync() -> None:
-        client = get_supabase_client()
+        client = _make_service_client()
         try:
             client.table("reports").update({
                 "sub_questions": sub_questions,
@@ -475,7 +541,7 @@ async def link_subquestion_run(
         result_run_id: The run ID of the DS-STAR execution that answered this question.
     """
     def _sync() -> None:
-        client = get_supabase_client()
+        client = _make_service_client()
         sq_id = f"{report_id}-q{question_index}"
         try:
             client.table("sub_questions").update({
@@ -512,7 +578,7 @@ async def update_report_status(
         total_ms: Wall-clock duration of the entire DeepResearch workflow.
     """
     def _sync() -> None:
-        client = get_supabase_client()
+        client = _make_service_client()
         updates = {
             "status": status,
             "title": title or None,
@@ -551,7 +617,7 @@ async def list_workspaces(user_id: str) -> List[Dict[str, Any]]:
         List[Dict[str, Any]]: Workspace rows ordered by creation date.
     """
     def _sync() -> List[Dict[str, Any]]:
-        client = get_supabase_client()
+        client = _make_anon_client()
         try:
             response = (
                 client.table("workspaces")
@@ -582,7 +648,7 @@ async def create_workspace(user_id: str, name: str) -> Dict[str, Any]:
         RuntimeError: If the insert fails.
     """
     def _sync() -> Dict[str, Any]:
-        client = get_supabase_client()
+        client = _make_service_client()
         record = {"user_id": user_id, "name": name}
         try:
             response = client.table("workspaces").insert(record).select().execute()
@@ -593,5 +659,46 @@ async def create_workspace(user_id: str, name: str) -> Dict[str, Any]:
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("[Supabase] Could not create workspace: %s", exc)
             raise RuntimeError(str(exc)) from exc
+
+    return await asyncio.get_running_loop().run_in_executor(None, _sync)
+
+
+async def get_workspace_stats(user_id: str) -> Dict[str, Any]:
+    """Returns per-workspace run statistics for the given user.
+
+    For each workspace the result contains:
+      - ``run_count``: total number of agent_runs with that workspace_id.
+      - ``last_run_at``: ISO timestamp of the most recent run (or None).
+
+    Args:
+        user_id: Authenticated user UUID.
+
+    Returns:
+        Dict keyed by workspace_id → {run_count, last_run_at}.
+    """
+    def _sync() -> Dict[str, Any]:
+        client = _make_service_client()
+        try:
+            response = (
+                client.table("agent_runs")
+                .select("workspace_id, created_at")
+                .eq("user_id", user_id)
+                .order("created_at", desc=True)
+                .limit(1000)
+                .execute()
+            )
+            rows = response.data or []
+            stats: Dict[str, Any] = {}
+            for row in rows:
+                ws_id = row.get("workspace_id")
+                if not ws_id:
+                    continue
+                if ws_id not in stats:
+                    stats[ws_id] = {"run_count": 0, "last_run_at": row.get("created_at")}
+                stats[ws_id]["run_count"] += 1
+            return stats
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("[Supabase] Could not fetch workspace stats: %s", exc)
+            return {}
 
     return await asyncio.get_running_loop().run_in_executor(None, _sync)

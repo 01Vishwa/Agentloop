@@ -46,6 +46,7 @@ export function useAgentRun(files) {
   const [totalRunMs, setTotalRunMs] = useState(0)
   const [complexity, setComplexity] = useState('easy')
   const [showMetrics, setShowMetrics] = useState(false)
+  const [lastSubmittedQuery, setLastSubmittedQuery] = useState('')
 
   // Deep Research mode state
   const [isResearchMode, setIsResearchMode] = useState(false)
@@ -55,6 +56,11 @@ export function useAgentRun(files) {
   const abortRef = useRef(false)
   const stepTimeoutsRef = useRef([])
   const streamRef = useRef(null)
+  // Per-run toast deduplication — prevents identical errors firing multiple popups
+  const toastedErrorsRef = useRef(new Set())
+  const errorToastCountRef = useRef(0)
+  // Throttle fetchHistory to avoid hammering /api/agent/runs on every event
+  const lastHistoryFetchRef = useRef(0)
 
   // Auth token — fetched fresh on each call to always use the latest session
   const { getAccessToken } = useAuth()
@@ -64,7 +70,10 @@ export function useAgentRun(files) {
   }, [])
 
   // ── History: fetch run list ───────────────────────────────────────────────
-  const fetchHistory = useCallback(async (limit = 20) => {
+  const fetchHistory = useCallback(async (limit = 20, force = false) => {
+    const now = Date.now()
+    if (!force && now - lastHistoryFetchRef.current < 15_000) return  // throttle: max once per 15s
+    lastHistoryFetchRef.current = now
     setHistoryLoading(true)
     try {
       const token = getAccessToken()
@@ -298,7 +307,7 @@ export function useAgentRun(files) {
         })
         addLog('[DeepResearch] ✓ ' + payload.message, 'success')
         toast('Deep Research complete!', 'success')
-        setTimeout(() => fetchHistory(), 1500)
+        setTimeout(() => fetchHistory(20, true), 1500)
         break
 
       case 'retrying':
@@ -342,7 +351,7 @@ export function useAgentRun(files) {
 
         addLog(`[DS-STAR] ✓ Completed in ${payload.rounds} round(s).`, 'success')
         toast('DS-STAR analysis complete!', 'success')
-        setTimeout(() => fetchHistory(), 1500)
+        setTimeout(() => fetchHistory(20, true), 1500)
         break
 
       case 'metrics':
@@ -364,8 +373,16 @@ export function useAgentRun(files) {
         setPhase('error')
         setAgentStatus('failed')
         addLog('[✗] ' + payload.message, 'error')
-        toast(`Agent error: ${payload.message}`, 'error')
-        setTimeout(() => fetchHistory(), 1500)
+        // Deduplicate: only show toast for unique messages, max 3 per run
+        {
+          const errKey = (payload.message || '').slice(0, 80)
+          if (!toastedErrorsRef.current.has(errKey) && errorToastCountRef.current < 3) {
+            toastedErrorsRef.current.add(errKey)
+            errorToastCountRef.current++
+            toast(`Agent error: ${payload.message}`, 'error')
+          }
+        }
+        setTimeout(() => fetchHistory(20, true), 1500)
         break
 
       case 'stream_end':
@@ -380,16 +397,23 @@ export function useAgentRun(files) {
   // ── Submit handler ────────────────────────────────────────────────────────
   const handleSubmit = useCallback(
     async (query, sessionId = '') => {
+      const trimmedQuery = (query || '').trim()
       const uploadedFiles = files.filter((f) => f.progress === 100)
       if (uploadedFiles.length === 0) {
         toast('Please upload at least one file first', 'error')
         return
       }
+      if (!trimmedQuery) return
+
+      setLastSubmittedQuery(trimmedQuery)
 
       stepTimeoutsRef.current.forEach(clearTimeout)
       stepTimeoutsRef.current = []
 
       abortRef.current = false
+      // Reset per-run toast deduplication state
+      toastedErrorsRef.current = new Set()
+      errorToastCountRef.current = 0
       setAgentStatus('analyzing')
       setPhase('analyzing')
       setPlanSteps([])
@@ -400,11 +424,15 @@ export function useAgentRun(files) {
       setOutput(null)
       setVerifierFeedback(null)
       setActiveRunId(null)
+      setRunMetrics(null)
+      setTotalRunMs(0)
+      setComplexity('easy')
+      setShowMetrics(false)
       setIsResearchMode(false)
       setSubQuestions([])
       setResearchReport(null)
 
-      addLog(`[DS-STAR] Starting run for query: "${query}"`, 'info')
+      addLog(`[DS-STAR] Starting run for query: "${trimmedQuery}"`, 'info')
 
       // Cancel any in-flight stream before starting a new one
       streamRef.current?.abort()
@@ -413,7 +441,7 @@ export function useAgentRun(files) {
       const token = getAccessToken()
 
       const { promise, abort } = createCancellableStream(
-        query,
+        trimmedQuery,
         handleAgentEvent,
         sessionId,
         settings,
@@ -435,6 +463,18 @@ export function useAgentRun(files) {
     [files, settings, handleAgentEvent, addLog, getAccessToken, activeWorkspace?.id],
   )
 
+  // ── Re-run handler: run the latest submitted query again ──────────────────
+  const rerunLastQuery = useCallback(
+    async (sessionId = '') => {
+      if (!lastSubmittedQuery) {
+        toast('No previous query to rerun yet.', 'warn')
+        return
+      }
+      await handleSubmit(lastSubmittedQuery, sessionId)
+    },
+    [lastSubmittedQuery, handleSubmit],
+  )
+
   // ── Reset handler ─────────────────────────────────────────────────────────
   const handleReset = useCallback(() => {
     stepTimeoutsRef.current.forEach(clearTimeout)
@@ -444,6 +484,9 @@ export function useAgentRun(files) {
     streamRef.current = null
 
     abortRef.current = true
+    // Reset per-run toast deduplication state
+    toastedErrorsRef.current = new Set()
+    errorToastCountRef.current = 0
     setAgentStatus('idle')
     setPhase('idle')
     setPlanSteps([])
@@ -453,6 +496,7 @@ export function useAgentRun(files) {
     setCurrentRound(0)
     setOutput(null)
     setVerifierFeedback(null)
+    setActiveRunId(null)
     setRunMetrics(null)
     setTotalRunMs(0)
     setComplexity('easy')
@@ -489,6 +533,7 @@ export function useAgentRun(files) {
         rounds: run.rounds || 0,
         execution_logs: run.execution_logs || [],
       })
+      if (run.query) setLastSubmittedQuery(run.query)
       setVerifierFeedback(null)
       setIsResearchMode(false)
       setSubQuestions([])
@@ -516,6 +561,7 @@ export function useAgentRun(files) {
     settings,
     setSettings,
     handleSubmit,
+    rerunLastQuery,
     handleReset,
     fetchHistory,
     loadRun,
@@ -524,6 +570,7 @@ export function useAgentRun(files) {
     totalRunMs,
     complexity,
     showMetrics,
+    lastSubmittedQuery,
     // Deep Research state
     isResearchMode,
     subQuestions,

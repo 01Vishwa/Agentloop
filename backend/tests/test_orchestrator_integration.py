@@ -93,7 +93,7 @@ async def test_orchestrator_two_rounds():
 
     call_count = {"n": 0}
 
-    async def verifier_side_effect(inputs):
+    async def verifier_side_effect(inputs, *args, **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 1:
             return fake_verifier_output(is_sufficient=False)
@@ -128,7 +128,7 @@ async def test_orchestrator_coder_retry():
 
     call_count = {"n": 0}
 
-    async def coder_side_effect(inputs):
+    async def coder_side_effect(inputs, *args, **kwargs):
         call_count["n"] += 1
         if call_count["n"] < 3:
             raise RuntimeError("NIM transient error")

@@ -10,18 +10,86 @@ Architecture position:
     Verifier [is_sufficient=True] → Finalizer → final_output
 """
 
+import asyncio
+import ast
 import logging
-import threading
 from typing import Any, Dict, List, Optional
 
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
+from core.llm_client import get_structured_llm
 from core.token_tracker import TokenTracker, tracker_callback_config
 
 logger = logging.getLogger("uvicorn.info")
 
 _MAX_OUTPUT_CHARS = 6_000
+
+
+def _is_column_listing_query(query: str) -> bool:
+    """Returns True when query intent is to list/show column names."""
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+    has_column_word = any(w in q for w in ("column", "columns", "header", "headers", "field", "fields"))
+    has_listing_intent = any(w in q for w in ("list", "show", "print", "display", "name", "names", "what are"))
+    return has_column_word and has_listing_intent
+
+
+def _extract_column_map_from_output(execution_output: str) -> Dict[str, List[str]]:
+    """Parses ``<file>: [..columns..]`` lines emitted by execution scripts."""
+    out = execution_output or ""
+    col_map: Dict[str, List[str]] = {}
+    for raw_line in out.splitlines():
+        line = raw_line.strip()
+        if not line or ":" not in line or "[" not in line or "]" not in line:
+            continue
+        left, right = line.split(":", 1)
+        file_name = left.strip() or "dataset"
+        list_start = right.find("[")
+        list_end = right.rfind("]")
+        if list_start < 0 or list_end <= list_start:
+            continue
+        bracket = right[list_start:list_end + 1]
+        try:
+            parsed = ast.literal_eval(bracket)
+        except Exception:  # pylint: disable=broad-except
+            continue
+        if isinstance(parsed, list):
+            cols = [str(c) for c in parsed if str(c).strip()]
+            if cols:
+                col_map[file_name] = cols
+    return col_map
+
+
+def _build_column_listing_final_output(col_map: Dict[str, List[str]]) -> Dict[str, Any]:
+    """Builds deterministic final output for column-listing style queries."""
+    if not col_map:
+        return {
+            "headline": "Columns could not be parsed from execution output.",
+            "formatted_output": (
+                "The run completed, but the column list was not found in stdout. "
+                "Please rerun with explicit `print(df.columns.tolist())` output."
+            ),
+            "confidence": 0.4,
+        }
+
+    total_cols = sum(len(cols) for cols in col_map.values())
+    file_count = len(col_map)
+    headline = f"Detected {total_cols} column(s) across {file_count} file(s)."
+    sections: list[str] = [
+        f"Found **{total_cols}** column(s) across **{file_count}** uploaded file(s).",
+        "",
+    ]
+    for fname, cols in col_map.items():
+        sections.append(f"### `{fname}`")
+        sections.extend(f"- `{c}`" for c in cols)
+        sections.append("")
+    return {
+        "headline": headline,
+        "formatted_output": "\n".join(sections).strip(),
+        "confidence": 1.0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -123,28 +191,27 @@ class FinalizerAgent:
         self._model = model
         self._temperature = temperature if temperature is not None else 0.1
         self._chain = None
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()  # async-safe lazy init
 
-    def _get_chain(self):
-        """Builds and caches the structured-output LangChain pipeline."""
-        with self._lock:
-            if self._chain is None:
-                from core.llm_client import get_structured_llm  # pylint: disable=import-outside-toplevel
-                from core.config import NIM_MODEL_FLASH  # pylint: disable=import-outside-toplevel
-                resolved = self._model or NIM_MODEL_FLASH
-                structured_llm = get_structured_llm(
-                    model=resolved,
-                    schema=FinalizerOutput,
-                    temperature=self._temperature,
-                )
-                self._chain = (
-                    ChatPromptTemplate.from_messages([
-                        ("system", _FINALIZER_SYSTEM),
-                        ("human", _FINALIZER_HUMAN),
-                    ])
-                    | structured_llm
-                )
-        return self._chain
+    def _build_chain(self):
+        """Builds (but does NOT cache) the LangChain pipeline.
+
+        Heavy work — LLM init, imports — happens here, OUTSIDE the async lock.
+        """
+        from core.config import NIM_MODEL_FLASH  # pylint: disable=import-outside-toplevel
+        resolved = self._model or NIM_MODEL_FLASH
+        structured_llm = get_structured_llm(
+            model=resolved,
+            schema=FinalizerOutput,
+            temperature=self._temperature,
+        )
+        return (
+            ChatPromptTemplate.from_messages([
+                ("system", _FINALIZER_SYSTEM),
+                ("human", _FINALIZER_HUMAN),
+            ])
+            | structured_llm
+        )
 
     async def finalize(
         self,
@@ -182,10 +249,29 @@ class FinalizerAgent:
         )
         trimmed_output = execution_output[:_MAX_OUTPUT_CHARS]
 
-        result: FinalizerOutput = await self._get_chain().ainvoke(
+        if _is_column_listing_query(query):
+            col_map = _extract_column_map_from_output(trimmed_output)
+            deterministic = _build_column_listing_final_output(col_map)
+            logger.info(
+                "[Finalizer] Deterministic column-list formatting applied | files=%d",
+                len(col_map),
+            )
+            return deterministic
+
+        if self._chain is None:
+            built = self._build_chain()      # heavy work — no lock held
+            async with self._lock:
+                if self._chain is None:      # double-checked locking
+                    self._chain = built
+        chain = self._chain
+
+        result: FinalizerOutput = await chain.ainvoke(
             {
                 "query": query,
                 "execution_output": trimmed_output or "(no output produced)",
+                # Backward-compatible key used by older tests/clients.
+                # Keep alongside artifact_list (the actual prompt placeholder).
+                "artifacts": ", ".join(artifact_names or []),
                 "artifact_list": artifact_list,
                 "plan_steps": formatted_steps,
             },

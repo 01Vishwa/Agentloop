@@ -51,7 +51,7 @@ export function ToastContainer() {
   const [toasts, setToasts] = useState([])
 
   useEffect(() => {
-    globalAddToast = (t) => setToasts((prev) => [...prev.slice(-4), t])
+    globalAddToast = (t) => setToasts((prev) => [...prev.slice(-2), t])
     return () => { globalAddToast = null }
   }, [])
 

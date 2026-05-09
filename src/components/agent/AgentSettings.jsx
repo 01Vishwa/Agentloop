@@ -28,12 +28,12 @@ const CODER_MODELS = [
 export const DEFAULT_SETTINGS = {
   maxRounds:   10,
   model:       'meta/llama-3.1-70b-instruct',
-  coderModel:  'meta/llama-3.1-70b-instruct',
+  coderModel:  'meta/codellama-70b-instruct',
   temperature: 0.1,
 }
 
 // ── Small labelled slider ────────────────────────────────────────────────────
-function Slider({ id, label, min, max, step, value, onChange, format }) {
+function Slider({ id, label, min, max, step, value, onChange, format, disabled = false }) {
   const percentage = ((value - min) / (max - min)) * 100;
   
   return (
@@ -54,8 +54,9 @@ function Slider({ id, label, min, max, step, value, onChange, format }) {
         step={step}
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
+        disabled={disabled}
         className="w-full h-1.5 bg-slate-200 rounded-full appearance-none cursor-pointer
-                   accent-brand-500 hover:accent-brand-600"
+                   accent-brand-500 hover:accent-brand-600 disabled:opacity-50 disabled:cursor-not-allowed"
         style={{
           background: `linear-gradient(to right, #3b82f6 0%, #3b82f6 ${percentage}%, #e2e8f0 ${percentage}%, #e2e8f0 100%)`
         }}
@@ -69,7 +70,7 @@ function Slider({ id, label, min, max, step, value, onChange, format }) {
 }
 
 // ── Select dropdown ──────────────────────────────────────────────────────────
-function Select({ id, label, value, onChange, options }) {
+function Select({ id, label, value, onChange, options, disabled = false }) {
   return (
     <div className="space-y-1.5">
       <label htmlFor={id} className="text-[11px] font-semibold text-slate-600 uppercase tracking-wider">
@@ -79,9 +80,11 @@ function Select({ id, label, value, onChange, options }) {
         id={id}
         value={value}
         onChange={(e) => onChange(e.target.value)}
+        disabled={disabled}
         className="w-full text-[12px] font-medium text-slate-700 bg-white border border-slate-200
                    rounded-lg px-3 py-2 cursor-pointer focus:outline-none focus:ring-2
-                   focus:ring-brand-300 focus:border-brand-400 transition-all"
+                   focus:ring-brand-300 focus:border-brand-400 transition-all
+                   disabled:opacity-50 disabled:cursor-not-allowed"
       >
         {options.map((opt) => (
           <option key={opt.value} value={opt.value}>{opt.label}</option>
@@ -94,19 +97,58 @@ function Select({ id, label, value, onChange, options }) {
 // ── Main component ───────────────────────────────────────────────────────────
 export function AgentSettings({ settings, onChange, disabled = false, placement = 'inline' }) {
   const [open, setOpen] = useState(false)
+  const [draftSettings, setDraftSettings] = useState(settings)
 
-  const updateField = (key, val) => onChange({ ...settings, [key]: val })
+  React.useEffect(() => {
+    if (open) {
+      setDraftSettings(settings)
+    }
+  }, [open, settings])
 
-  const isModified = (
+  React.useEffect(() => {
+    if (!open) return
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        setOpen(false)
+      }
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [open])
+
+  const updateField = (key, val) => setDraftSettings({ ...draftSettings, [key]: val })
+
+  const isSavedModified = (
     settings.maxRounds   !== DEFAULT_SETTINGS.maxRounds   ||
     settings.model       !== DEFAULT_SETTINGS.model       ||
     settings.coderModel  !== DEFAULT_SETTINGS.coderModel  ||
     settings.temperature !== DEFAULT_SETTINGS.temperature
   )
 
-  const handleReset = (e) => {
+  const isDraftModified = (
+    draftSettings.maxRounds   !== DEFAULT_SETTINGS.maxRounds   ||
+    draftSettings.model       !== DEFAULT_SETTINGS.model       ||
+    draftSettings.coderModel  !== DEFAULT_SETTINGS.coderModel  ||
+    draftSettings.temperature !== DEFAULT_SETTINGS.temperature
+  )
+
+  const handleResetSaved = (e) => {
     e.stopPropagation()
     onChange({ ...DEFAULT_SETTINGS })
+  }
+
+  const handleResetDraft = (e) => {
+    e.stopPropagation()
+    setDraftSettings({ ...DEFAULT_SETTINGS })
+  }
+
+  const handleApply = () => {
+    onChange(draftSettings)
+    setOpen(false)
+  }
+
+  const handleCancel = () => {
+    setOpen(false)
   }
 
   const isAbsolute = placement === 'header';
@@ -128,7 +170,7 @@ export function AgentSettings({ settings, onChange, disabled = false, placement 
           title="Agent Settings"
         >
           <Settings2 size={16} />
-          {isModified && (
+          {isSavedModified && (
             <div className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-brand-500 rounded-full border-2 border-white" />
           )}
         </button>
@@ -146,16 +188,16 @@ export function AgentSettings({ settings, onChange, disabled = false, placement 
             Agent Settings
           </span>
 
-          {isModified && (
+          {isSavedModified && (
             <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full
                              bg-brand-100 text-brand-600 uppercase tracking-wider">
               Modified
             </span>
           )}
 
-          {isModified && !disabled && (
+          {isSavedModified && !disabled && (
             <button
-              onClick={handleReset}
+              onClick={handleResetSaved}
               title="Reset to defaults"
               className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors"
             >
@@ -180,9 +222,9 @@ export function AgentSettings({ settings, onChange, disabled = false, placement 
           {isAbsolute && (
             <div className="flex items-center justify-between pb-2 border-b border-slate-100">
               <span className="text-[13px] font-bold text-slate-800">Agent Settings</span>
-              {isModified && !disabled && (
+              {isDraftModified && !disabled && (
                 <button
-                  onClick={handleReset}
+                  onClick={handleResetDraft}
                   className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-400 hover:text-brand-600 transition-colors"
                 >
                   <RotateCcw size={12} />
@@ -199,9 +241,10 @@ export function AgentSettings({ settings, onChange, disabled = false, placement 
             min={1}
             max={10}
             step={1}
-            value={settings.maxRounds}
+            value={draftSettings.maxRounds}
             onChange={(v) => updateField('maxRounds', v)}
             format={(v) => `${v} round${v !== 1 ? 's' : ''}`}
+            disabled={disabled}
           />
 
           {/* Temperature */}
@@ -211,33 +254,52 @@ export function AgentSettings({ settings, onChange, disabled = false, placement 
             min={0.0}
             max={1.0}
             step={0.05}
-            value={settings.temperature}
+            value={draftSettings.temperature}
             onChange={(v) => updateField('temperature', v)}
             format={(v) => v.toFixed(2)}
+            disabled={disabled}
           />
 
           {/* Reasoning Model */}
           <Select
             id="setting-reasoning-model"
             label="Reasoning Model (Planner / Verifier / Router)"
-            value={settings.model}
+            value={draftSettings.model}
             onChange={(v) => updateField('model', v)}
             options={REASONING_MODELS}
+            disabled={disabled}
           />
 
           {/* Coder Model */}
           <Select
             id="setting-coder-model"
             label="Coder Model"
-            value={settings.coderModel}
+            value={draftSettings.coderModel}
             onChange={(v) => updateField('coderModel', v)}
             options={CODER_MODELS}
+            disabled={disabled}
           />
 
           <p className="text-[10px] text-slate-400 leading-relaxed pt-1">
             Settings apply to the next run only. Lower temperature = more deterministic output.
             Higher max rounds gives the agent more time to self-correct.
           </p>
+
+          <div className="flex items-center justify-end gap-2 pt-4 border-t border-slate-100">
+            <button
+              onClick={handleCancel}
+              className="px-4 py-1.5 rounded-lg text-[12px] font-semibold text-slate-600 hover:bg-slate-100 transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleApply}
+              disabled={disabled}
+              className="px-4 py-1.5 rounded-lg text-[12px] font-semibold bg-brand-500 text-white hover:bg-brand-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+            >
+              Apply
+            </button>
+          </div>
         </div>
       )}
     </div>

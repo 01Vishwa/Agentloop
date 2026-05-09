@@ -1,17 +1,73 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useState, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Plus, Briefcase, Loader2, ArrowRight, FolderKanban, LogOut, User } from 'lucide-react'
+import {
+  Plus, Briefcase, Loader2, ArrowRight,
+  FolderKanban, LogOut, User, BarChart2, Clock,
+  Search, ArrowUpDown, ChevronUp, ChevronDown
+} from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { useWorkspaceStore } from '../stores/workspaceStore'
+import { supabase } from '../lib/supabaseClient'
 
 export function ProjectsPage() {
-  const { user, signOut, isAuthenticated, loading: authLoading } = useAuth()
+  const { user, signOut, isAuthenticated, loading: authLoading, getAccessToken } = useAuth()
   const { workspaces, loading: wsLoading, fetchWorkspaces, createWorkspace, setActiveWorkspace } = useWorkspaceStore()
   const navigate = useNavigate()
 
   const [isCreating, setIsCreating] = useState(false)
   const [newProjectName, setNewProjectName] = useState('')
   const [createLoading, setCreateLoading] = useState(false)
+  // Per-workspace run stats: { [workspace_id]: { run_count, last_run_at } }
+  const [wsStats, setWsStats] = useState({})
+
+  const [searchQuery, setSearchQuery] = useState('')
+  const [sortConfig, setSortConfig] = useState({ key: 'created_at', direction: 'desc' })
+
+  // Filtering and Sorting logic
+  const filteredAndSortedWorkspaces = useMemo(() => {
+    let result = [...workspaces]
+
+    if (searchQuery.trim()) {
+      const query = searchQuery.toLowerCase()
+      result = result.filter(ws => ws.name.toLowerCase().includes(query))
+    }
+
+    result.sort((a, b) => {
+      let aVal, bVal
+      
+      if (sortConfig.key === 'name') {
+        aVal = a.name.toLowerCase()
+        bVal = b.name.toLowerCase()
+      } else if (sortConfig.key === 'created_at') {
+        aVal = new Date(a.created_at).getTime()
+        bVal = new Date(b.created_at).getTime()
+      } else if (sortConfig.key === 'run_count') {
+        aVal = wsStats[a.id]?.run_count || 0
+        bVal = wsStats[b.id]?.run_count || 0
+      } else if (sortConfig.key === 'last_run_at') {
+        aVal = wsStats[a.id]?.last_run_at ? new Date(wsStats[a.id].last_run_at).getTime() : 0
+        bVal = wsStats[b.id]?.last_run_at ? new Date(wsStats[b.id].last_run_at).getTime() : 0
+      }
+
+      if (aVal < bVal) return sortConfig.direction === 'asc' ? -1 : 1
+      if (aVal > bVal) return sortConfig.direction === 'asc' ? 1 : -1
+      return 0
+    })
+
+    return result
+  }, [workspaces, searchQuery, sortConfig, wsStats])
+
+  const handleSort = (key) => {
+    setSortConfig(prev => ({
+      key,
+      direction: prev.key === key && prev.direction === 'asc' ? 'desc' : 'asc'
+    }))
+  }
+
+  const SortIcon = ({ sortKey }) => {
+    if (sortConfig.key !== sortKey) return <ArrowUpDown size={14} className="text-slate-300 opacity-0 group-hover:opacity-100 transition-opacity ml-1 inline-block" />
+    return sortConfig.direction === 'asc' ? <ChevronUp size={14} className="text-brand-500 ml-1 inline-block" /> : <ChevronDown size={14} className="text-brand-500 ml-1 inline-block" />
+  }
 
   // Redirect if not authenticated
   useEffect(() => {
@@ -27,6 +83,27 @@ export function ProjectsPage() {
     }
   }, [user?.id, fetchWorkspaces])
 
+  // Fetch per-workspace run statistics for card display
+  useEffect(() => {
+    if (!user?.id || workspaces.length === 0) return
+    const loadStats = async () => {
+      try {
+        const { data: { session } } = await supabase.auth.getSession()
+        const token = session?.access_token
+        const res = await fetch('/api/workspaces/stats', {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        })
+        if (res.ok) {
+          const data = await res.json()
+          setWsStats(data)
+        }
+      } catch {
+        // Silently ignore — stats are decorative
+      }
+    }
+    loadStats()
+  }, [user?.id, workspaces.length])
+
   const handleSelectProject = (project) => {
     setActiveWorkspace(project)
     navigate(`/project/${project.id}`)
@@ -40,7 +117,6 @@ export function ProjectsPage() {
       const newWs = await createWorkspace(user.id, newProjectName)
       setNewProjectName('')
       setIsCreating(false)
-      // Navigate straight to the newly created project
       handleSelectProject(newWs)
     } catch (err) {
       console.error('Failed to create project:', err)
@@ -77,7 +153,7 @@ export function ProjectsPage() {
               <span className="hidden sm:block max-w-[150px] truncate">{user?.email}</span>
             </div>
             <button
-              onClick={() => { signOut(); navigate('/') }}
+              onClick={async () => { await signOut(); navigate('/', { state: { signedOut: true } }) }}
               className="btn-ghost px-3 text-[12px]"
               title="Sign out"
             >
@@ -92,7 +168,7 @@ export function ProjectsPage() {
         <div className="flex items-center justify-between mb-10">
           <div>
             <h1 className="text-3xl font-extrabold text-slate-900 tracking-tight">Your Projects</h1>
-            <p className="text-slate-500 mt-2">Select a project to continue or create a new isolated workspace.</p>
+            <p className="text-slate-500 mt-2">Each project maintains its own files, run history, and analysis context.</p>
           </div>
           <button
             onClick={() => setIsCreating(true)}
@@ -128,6 +204,24 @@ export function ProjectsPage() {
           </div>
         )}
 
+        {workspaces.length > 0 && !isCreating && (
+          <div className="mb-6 flex flex-col sm:flex-row gap-4 items-center justify-between bg-white p-4 rounded-2xl shadow-sm border border-slate-100">
+            <div className="relative w-full sm:max-w-md">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
+              <input
+                type="text"
+                placeholder="Search projects..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full pl-10 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 transition-all text-sm"
+              />
+            </div>
+            <div className="text-sm text-slate-500 font-medium">
+              Showing {filteredAndSortedWorkspaces.length} project{filteredAndSortedWorkspaces.length !== 1 ? 's' : ''}
+            </div>
+          </div>
+        )}
+
         {workspaces.length === 0 && !wsLoading && !isCreating ? (
           <div className="text-center py-20 px-6 glass-card-elevated border-dashed border-2 border-slate-200">
             <Briefcase size={48} className="mx-auto text-slate-300 mb-4" />
@@ -138,27 +232,103 @@ export function ProjectsPage() {
               Create Project
             </button>
           </div>
+        ) : filteredAndSortedWorkspaces.length === 0 && workspaces.length > 0 && !isCreating ? (
+           <div className="text-center py-20 px-6 glass-card-elevated border-dashed border-2 border-slate-200">
+             <Search size={48} className="mx-auto text-slate-300 mb-4" />
+             <h2 className="text-lg font-bold text-slate-700 mb-2">No results found</h2>
+             <p className="text-slate-500 mb-6">No projects match your search query "{searchQuery}".</p>
+             <button onClick={() => setSearchQuery('')} className="btn-secondary mx-auto">
+               Clear Search
+             </button>
+           </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {workspaces.map((ws) => (
-              <div
-                key={ws.id}
-                onClick={() => handleSelectProject(ws)}
-                className="group cursor-pointer glass-card-elevated p-6 transition-all duration-300 hover:shadow-xl hover:shadow-brand-500/10 hover:-translate-y-1 hover:border-brand-300"
-              >
-                <div className="flex items-start justify-between mb-4">
-                  <div className="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center text-slate-500 group-hover:bg-brand-100 group-hover:text-brand-600 transition-colors">
-                    <Briefcase size={20} />
-                  </div>
-                  <ArrowRight size={16} className="text-slate-300 opacity-0 group-hover:opacity-100 group-hover:text-brand-500 group-hover:translate-x-1 transition-all" />
-                </div>
-                <h3 className="text-lg font-bold text-slate-800 mb-1 truncate">{ws.name}</h3>
-                <p className="text-xs text-slate-400">
-                  Created {new Date(ws.created_at).toLocaleDateString()}
-                </p>
+          !isCreating && (
+            <div className="glass-card-elevated overflow-hidden border border-slate-200 bg-white shadow-sm rounded-2xl">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse min-w-[700px]">
+                  <thead>
+                    <tr className="border-b border-slate-200 bg-slate-50/50">
+                      <th className="p-4 font-semibold text-slate-600 text-sm cursor-pointer group hover:bg-slate-100 transition-colors w-[35%]" onClick={() => handleSort('name')}>
+                        <div className="flex items-center">
+                          Project Name
+                          <SortIcon sortKey="name" />
+                        </div>
+                      </th>
+                      <th className="p-4 font-semibold text-slate-600 text-sm cursor-pointer group hover:bg-slate-100 transition-colors w-[20%]" onClick={() => handleSort('created_at')}>
+                        <div className="flex items-center">
+                          Created Date
+                          <SortIcon sortKey="created_at" />
+                        </div>
+                      </th>
+                      <th className="p-4 font-semibold text-slate-600 text-sm cursor-pointer group hover:bg-slate-100 transition-colors w-[15%]" onClick={() => handleSort('run_count')}>
+                        <div className="flex items-center">
+                          Runs
+                          <SortIcon sortKey="run_count" />
+                        </div>
+                      </th>
+                      <th className="p-4 font-semibold text-slate-600 text-sm cursor-pointer group hover:bg-slate-100 transition-colors w-[20%]" onClick={() => handleSort('last_run_at')}>
+                        <div className="flex items-center">
+                          Last Run
+                          <SortIcon sortKey="last_run_at" />
+                        </div>
+                      </th>
+                      <th className="p-4 font-semibold text-slate-600 text-sm text-right w-[10%]">
+                        Action
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredAndSortedWorkspaces.map((ws) => {
+                      const stats = wsStats[ws.id]
+                      const runCount = stats?.run_count ?? 0
+                      const lastRun = stats?.last_run_at
+                        ? new Date(stats.last_run_at).toLocaleDateString()
+                        : null
+
+                      return (
+                        <tr 
+                          key={ws.id}
+                          onClick={() => handleSelectProject(ws)}
+                          className="group border-b border-slate-100 hover:bg-brand-50/30 cursor-pointer transition-colors last:border-b-0"
+                        >
+                          <td className="p-4">
+                            <div className="flex items-center gap-3">
+                              <div className="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center text-slate-500 group-hover:bg-brand-100 group-hover:text-brand-600 transition-colors shrink-0">
+                                <Briefcase size={18} />
+                              </div>
+                              <span className="font-semibold text-slate-800 text-base truncate max-w-[250px]">{ws.name}</span>
+                            </div>
+                          </td>
+                          <td className="p-4 text-sm text-slate-500">
+                            {new Date(ws.created_at).toLocaleDateString()}
+                          </td>
+                          <td className="p-4">
+                            <div className="flex items-center gap-1.5 text-sm font-medium text-slate-600">
+                              <BarChart2 size={14} className="text-brand-400" />
+                              {runCount} run{runCount !== 1 ? 's' : ''}
+                            </div>
+                          </td>
+                          <td className="p-4">
+                            {lastRun ? (
+                              <div className="flex items-center gap-1.5 text-sm text-slate-500">
+                                <Clock size={14} />
+                                {lastRun}
+                              </div>
+                            ) : (
+                              <span className="text-sm text-slate-300 italic font-medium">No runs yet</span>
+                            )}
+                          </td>
+                          <td className="p-4 text-right pr-6">
+                            <ArrowRight size={18} className="inline-block text-slate-300 group-hover:text-brand-500 group-hover:translate-x-1 transition-all" />
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
               </div>
-            ))}
-          </div>
+            </div>
+          )
         )}
       </main>
     </div>

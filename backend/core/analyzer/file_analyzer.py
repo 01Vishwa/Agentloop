@@ -50,15 +50,29 @@ script that PRINTS the most important structural information about the file.
 The script will be executed with the file content available as a variable
 named `_FILE_CONTENT_BYTES` (bytes) and `_FILE_CONTENT_STR` (decoded string).
 
-REQUIRED output sections (print each):
-1. "--- Essential Information ---"
-2. Data type / source type label
-3. Column names and their dtypes (for tabular data)
-4. Shape or row count
-5. First 5 rows as a formatted table (for tabular data) or first 500 chars (for text)
-6. Any detected anomalies (all-null columns, obvious encoding issues)
+FILE TYPE BRANCHING — read carefully:
 
-Rules:
+For STRUCTURED files (CSV, XLSX, Parquet, JSON with tabular records):
+  REQUIRED output sections (print each):
+  1. "--- Essential Information ---"
+  2. Data type label (e.g. CSV tabular)
+  3. Column names and their dtypes
+  4. Shape (rows x cols)
+  5. First 5 rows as a formatted table
+  6. Any detected anomalies (all-null columns, duplicate rows, obvious encoding issues)
+
+For UNSTRUCTURED files (TXT, MD, Markdown, HTML, PDF, plain text):
+  Do NOT attempt to find column names or data types — this file has no rows.
+  REQUIRED output sections (print each):
+  1. "--- Essential Information ---"
+  2. File type label (e.g. Markdown document / Plain text)
+  3. Total character count and estimated word count
+  4. Number of sections/headings detected (for MD/HTML) or paragraph count (for TXT)
+  5. First 500 characters as a text preview
+  6. List of top-level headings or section titles (if present)
+  7. Any detected anomalies (encoding errors, empty file, binary content)
+
+Rules (apply to ALL types):
 - Use only: pandas, json, io, re, and standard library.
 - NEVER import from the filesystem — use _FILE_CONTENT_BYTES directly.
 - Print clean, structured text. No tracebacks.
@@ -90,14 +104,22 @@ class FileAnalyzerAgent:
     """
 
     def __init__(self) -> None:
-        self._chain = None  # lazily built
+        self._chain = None  # lazily built; reset on every analyze() call
+
+    def _reset_chain(self) -> None:
+        """Clears the cached LLM chain so the next call rebuilds with fresh context.
+
+        Called at the top of ``analyze()`` on every invocation. Prevents stale
+        column names from a previous file upload bleeding into code generated
+        for the current session when the orchestrator singleton reuses this agent.
+        """
+        self._chain = None
 
     def _get_chain(self):
         """Builds and caches the LLM chain for script generation."""
         if self._chain is None:
-            from core.llm_client import get_nim_llm  # pylint: disable=import-outside-toplevel
-            llm = get_nim_llm(temperature=0.0)
-            structured_llm = llm.with_structured_output(AnalyzerScriptOutput)
+            from core.llm_client import get_flash_structured_llm  # pylint: disable=import-outside-toplevel
+            structured_llm = get_flash_structured_llm(AnalyzerScriptOutput, temperature=0.0)
             self._chain = (
                 ChatPromptTemplate.from_messages([
                     ("system", _ANALYZER_SYSTEM),
@@ -107,8 +129,12 @@ class FileAnalyzerAgent:
             )
         return self._chain
 
-    def analyze(self, combined_extractions: Dict[str, Any]) -> str:
+    async def analyze(self, combined_extractions: Dict[str, Any], session_id: str = "__anon__") -> str:
         """Builds a data description from the processing context.
+
+        Resets the internal LLM chain at the start of each call so that
+        column names from a previous file upload cannot pollute the description
+        generated for the current request.
 
         For each file:
         1. Attempts to generate and execute an LLM inspection script.
@@ -121,6 +147,10 @@ class FileAnalyzerAgent:
         Returns:
             Multi-section plain-English data description string.
         """
+        # Fix 2 (P0): Reset chain on every analyze() call so stale column
+        # context from a previous file/session does not persist.
+        self._reset_chain()
+
         if not combined_extractions:
             return "No data files are available in the current context."
 
@@ -131,7 +161,7 @@ class FileAnalyzerAgent:
                 continue
 
             # Try LLM-based analysis first, then fall back
-            section_text = self._analyze_file_with_llm(filename, doc)
+            section_text = await self._analyze_file_with_llm(filename, doc, session_id)
             if section_text is None:
                 section_text = self._analyze_file_static(filename, doc)
 
@@ -143,8 +173,8 @@ class FileAnalyzerAgent:
         )
         return description
 
-    def _analyze_file_with_llm(
-        self, filename: str, doc: Dict[str, Any]
+    async def _analyze_file_with_llm(
+        self, filename: str, doc: Dict[str, Any], session_id: str = "__anon__"
     ) -> "str | None":
         """Generates and executes an LLM introspection script for one file.
 
@@ -157,7 +187,6 @@ class FileAnalyzerAgent:
         """
         try:
             import asyncio  # pylint: disable=import-outside-toplevel
-            import concurrent.futures  # pylint: disable=import-outside-toplevel
             import subprocess  # pylint: disable=import-outside-toplevel
             import sys  # pylint: disable=import-outside-toplevel
             import tempfile  # pylint: disable=import-outside-toplevel
@@ -167,20 +196,15 @@ class FileAnalyzerAgent:
             content_preview = doc.get("sanitized_content", "")[:2000]
 
             # Generate the inspection script via LLM.
-            # We always use ThreadPoolExecutor + asyncio.run() because this
-            # synchronous method is called from within FastAPI's running async
-            # event loop — loop.run_until_complete() would deadlock there.
             chain = self._get_chain()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(
-                    asyncio.run,
-                    chain.ainvoke({
-                        "file_name": filename,
-                        "source_type": source_type.upper(),
-                        "content_preview": content_preview,
-                    })
-                )
-                result: AnalyzerScriptOutput = future.result(timeout=30)
+            result: AnalyzerScriptOutput = await asyncio.wait_for(
+                chain.ainvoke({
+                    "file_name": filename,
+                    "source_type": source_type.upper(),
+                    "content_preview": content_preview,
+                }),
+                timeout=20.0
+            )
 
             script = result.script
             if script.startswith("```"):
@@ -191,7 +215,7 @@ class FileAnalyzerAgent:
 
             # Inject file content into the script preamble
             from services.upload_service import get_file_content  # pylint: disable=import-outside-toplevel
-            raw_bytes = get_file_content(filename) or b""
+            raw_bytes = get_file_content(filename, session_id=session_id) or b""
 
             preamble = (
                 "import sys, io, json, re\n"
@@ -201,11 +225,16 @@ class FileAnalyzerAgent:
             )
             full_script = preamble + script
 
-            # Execute in a minimal subprocess with sanitised environment
+            # Execute in a minimal subprocess with sanitised environment.
+            # GAP-04 fix: include Windows-specific vars (SystemDrive, APPDATA,
+            # LOCALAPPDATA) required for Python DLL resolution on Windows.
             safe_env = {
                 k: v for k, v in os.environ.items()
-                if k in {"PATH", "PYTHONPATH", "HOME", "USERPROFILE", "SYSTEMROOT",
-                         "TEMP", "TMP", "LANG", "LC_ALL"}
+                if k in {
+                    "PATH", "PYTHONPATH", "HOME", "USERPROFILE", "SYSTEMROOT",
+                    "SystemDrive", "APPDATA", "LOCALAPPDATA",
+                    "TEMP", "TMP", "LANG", "LC_ALL",
+                }
             }
             safe_env["PYTHONDONTWRITEBYTECODE"] = "1"
 
@@ -214,7 +243,8 @@ class FileAnalyzerAgent:
                 with open(script_path, "w", encoding="utf-8") as fh:
                     fh.write(full_script)
 
-                proc = subprocess.run(
+                proc = await asyncio.to_thread(
+                    subprocess.run,
                     [sys.executable, script_path],
                     capture_output=True,
                     text=True,

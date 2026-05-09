@@ -59,6 +59,8 @@ SUPABASE_BUCKET: str = os.getenv("SUPABASE_BUCKET", "agentloop-uploads")
 # JWT secret for server-side token verification.
 # Find at: Supabase Dashboard → Settings → API → JWT Settings → JWT Secret
 SUPABASE_JWT_SECRET: str = os.getenv("SUPABASE_JWT_SECRET", "")
+SUPABASE_SERVICE_ROLE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +76,7 @@ NIM_MODEL_DEFAULT: str = os.getenv(
 
 # Code-generation model (stronger for producing runnable Python)
 NIM_MODEL_CODER: str = os.getenv(
-    "NIM_MODEL_CODER", "meta/llama-3.1-70b-instruct"
+    "NIM_MODEL_CODER", "meta/llama-3.3-70b-instruct"
 )
 
 # ---------------------------------------------------------------------------
@@ -106,6 +108,10 @@ MAX_DEBUGGER_RETRIES: int = int(os.getenv("MAX_DEBUGGER_RETRIES", "3"))
 
 # DS-STAR+ concurrency: parallel DS-STAR runs for sub-questions
 DS_STAR_PLUS_MAX_WORKERS: int = int(os.getenv("DS_STAR_PLUS_MAX_WORKERS", "3"))
+
+# DS-STAR+ per-sub-question round cap (narrower scope → fewer rounds needed).
+# Kept deliberately lower than MAX_AGENT_ROUNDS to avoid a 5×10-round runaway.
+DS_STAR_PLUS_MAX_ROUNDS: int = int(os.getenv("DS_STAR_PLUS_MAX_ROUNDS", "3"))
 
 # ---------------------------------------------------------------------------
 # Docker sandbox configuration (Gap 2)

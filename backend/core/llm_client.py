@@ -33,24 +33,44 @@ _NON_FUNCTION_CALLING_MODELS = frozenset({
     "google/gemma-4-31b-it",
     "google/gemma-3-27b-it",
     "mistralai/mixtral-8x7b-instruct-v0.1",
+    "nvidia/nemotron-3-super-120b-a12b",
+    # CodeLlama does not support OpenAI function-calling schema;
+    # use JSON-mode structured output instead.
+    "meta/codellama-70b-instruct",
 })
 
 # ---------------------------------------------------------------------------
-# Module-level singleton cache: cache_key → ChatNVIDIA instance
+# Module-level singleton caches: cache_key → ChatNVIDIA instance
+#
+# We intentionally isolate caches by "scope":
+# - shared: default general-purpose cache
+# - structured: used by with_structured_output bindings
+# - raw: used by raw-completion fallback paths
+#
+# This prevents a structured-output path from accidentally reusing the same
+# underlying client instance as a raw path for the same model+temperature.
 # ---------------------------------------------------------------------------
 
-_llm_cache: dict[str, ChatNVIDIA] = {}
+_llm_cache_shared: dict[str, ChatNVIDIA] = {}
+_llm_cache_structured: dict[str, ChatNVIDIA] = {}
+_llm_cache_raw: dict[str, ChatNVIDIA] = {}
 
 
 def get_nim_llm(
     model: Optional[str] = None,
     temperature: float = 0.1,
+    *,
+    cache_scope: str = "shared",
+    use_cache: bool = True,
 ) -> ChatNVIDIA:
     """Returns a cached ChatNVIDIA instance for the requested model.
 
     Args:
         model: NIM model identifier. Defaults to ``NIM_MODEL_DEFAULT``.
         temperature: Sampling temperature (lower = more deterministic).
+        cache_scope: Cache partition. One of ``shared``, ``structured``, ``raw``.
+            Use distinct scopes when callers must avoid cross-path reuse.
+        use_cache: When False, always create a fresh ChatNVIDIA instance.
 
     Returns:
         ChatNVIDIA: Authenticated, ready-to-use LLM instance.
@@ -67,29 +87,50 @@ def get_nim_llm(
     resolved_model = model or NIM_MODEL_DEFAULT
     cache_key = f"{resolved_model}:{temperature}"
 
-    if cache_key not in _llm_cache:
-        kwargs: dict = {}
-
-        # Gemma-4 thinking mode
-        if resolved_model == "google/gemma-4-31b-it":
-            kwargs["model_kwargs"] = {
-                "chat_template_kwargs": {"enable_thinking": True}
-            }
-
-        _llm_cache[cache_key] = ChatNVIDIA(
-            model=resolved_model,
-            api_key=NVIDIA_API_KEY,
-            temperature=temperature,
-            timeout=60,
-            **kwargs,
-        )
-        logger.info(
-            "[NIM] ChatNVIDIA initialised — model=%s, temp=%.2f",
-            resolved_model,
-            temperature,
+    cache_map = {
+        "shared": _llm_cache_shared,
+        "structured": _llm_cache_structured,
+        "raw": _llm_cache_raw,
+    }.get(cache_scope)
+    if cache_map is None:
+        raise ValueError(
+            f"Unknown cache_scope '{cache_scope}'. Expected one of: shared, structured, raw."
         )
 
-    return _llm_cache[cache_key]
+    if use_cache and cache_key in cache_map:
+        return cache_map[cache_key]
+
+    kwargs: dict = {}
+
+    # Gemma-4 thinking mode
+    if resolved_model == "google/gemma-4-31b-it":
+        kwargs["model_kwargs"] = {
+            "chat_template_kwargs": {"enable_thinking": True}
+        }
+
+    # Nemotron-3 Super thinking mode
+    elif resolved_model == "nvidia/nemotron-3-super-120b-a12b":
+        kwargs["chat_template_kwargs"] = {"enable_thinking": True}
+        kwargs["max_tokens"] = 16384
+        kwargs["top_p"] = 0.95
+        kwargs["reasoning_budget"] = 16384
+
+    llm = ChatNVIDIA(
+        model=resolved_model,
+        api_key=NVIDIA_API_KEY,
+        temperature=temperature,
+        **kwargs,
+    )
+    if use_cache:
+        cache_map[cache_key] = llm
+    logger.info(
+        "[NIM] ChatNVIDIA initialised — model=%s, temp=%.2f, scope=%s, cached=%s",
+        resolved_model,
+        temperature,
+        cache_scope,
+        use_cache,
+    )
+    return llm
 
 
 def supports_function_calling(model: Optional[str] = None) -> bool:
@@ -120,15 +161,36 @@ def get_structured_llm(model: Optional[str], schema, temperature: float = 0.1):
     Returns:
         Runnable LLM chain that outputs the schema type.
     """
-    llm = get_nim_llm(model=model, temperature=temperature)
+    return get_structured_llm_with_mode(
+        model=model,
+        schema=schema,
+        temperature=temperature,
+        force_json_mode=False,
+    )
+
+
+def get_structured_llm_with_mode(
+    model: Optional[str],
+    schema,
+    temperature: float = 0.1,
+    *,
+    force_json_mode: bool = False,
+):
+    """Returns an LLM bound to a schema with explicit structured-output mode.
+
+    JSON-mode avoids tool/function calling and is more robust for agents like the
+    Coder that must always return a fixed JSON object (e.g. {"code": "..."}).
+    """
+    llm = get_nim_llm(model=model, temperature=temperature, cache_scope="structured")
+
+    if force_json_mode:
+        logger.info("[NIM] Forced JSON-mode structured output for model=%s", model)
+        return llm.with_structured_output(schema, method="json_mode")
 
     if supports_function_calling(model):
         return llm.with_structured_output(schema)
 
-    # JSON-mode fallback for non-function-calling models
-    logger.info(
-        "[NIM] Using JSON-mode structured output for model=%s", model
-    )
+    logger.info("[NIM] Using JSON-mode structured output for model=%s", model)
     return llm.with_structured_output(schema, method="json_mode")
 
 

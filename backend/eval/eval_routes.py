@@ -14,7 +14,8 @@ Endpoints:
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from middleware.auth import AuthUser, get_current_user
 
 logger = logging.getLogger("uvicorn.info")
 
@@ -26,7 +27,9 @@ eval_router = APIRouter(tags=["eval"])
 # ---------------------------------------------------------------------------
 
 @eval_router.get("/overview")
-async def eval_overview() -> Dict[str, Any]:
+async def eval_overview(
+    auth: AuthUser = Depends(get_current_user),
+) -> Dict[str, Any]:
     """Returns aggregated system-level KPIs from all recorded runs.
 
     Returns:
@@ -46,7 +49,9 @@ async def eval_overview() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 @eval_router.get("/agents")
-async def eval_agents() -> List[Dict[str, Any]]:
+async def eval_agents(
+    auth: AuthUser = Depends(get_current_user),
+) -> List[Dict[str, Any]]:
     """Returns per-agent performance metrics aggregated across all runs.
 
     Returns:
@@ -65,7 +70,9 @@ async def eval_agents() -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 @eval_router.get("/debug-loop")
-async def eval_debug_loop() -> Dict[str, Any]:
+async def eval_debug_loop(
+    auth: AuthUser = Depends(get_current_user),
+) -> Dict[str, Any]:
     """Returns debug loop depth and error type distribution.
 
     Returns:
@@ -87,8 +94,9 @@ async def eval_debug_loop() -> Dict[str, Any]:
 @eval_router.get("/runs")
 async def eval_runs(
     limit: int = Query(default=50, ge=1, le=100),
-    difficulty: Optional[str] = Query(default=None, regex="^(easy|hard)$"),
-    mode: Optional[str] = Query(default=None, regex="^(live|batch)$"),
+    difficulty: Optional[str] = Query(default=None, pattern="^(easy|hard)$"),
+    mode: Optional[str] = Query(default=None, pattern="^(live|batch)$"),
+    auth: AuthUser = Depends(get_current_user),
 ) -> List[Dict[str, Any]]:
     """Returns a paginated list of runs with their computed eval metrics.
 
@@ -113,7 +121,10 @@ async def eval_runs(
 # ---------------------------------------------------------------------------
 
 @eval_router.get("/runs/{run_id}/trace")
-async def eval_run_trace(run_id: str) -> Dict[str, Any]:
+async def eval_run_trace(
+    run_id: str,
+    auth: AuthUser = Depends(get_current_user),
+) -> Dict[str, Any]:
     """Returns the step-by-step eval trace and metadata for one run.
 
     Args:

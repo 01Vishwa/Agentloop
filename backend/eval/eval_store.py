@@ -18,9 +18,20 @@ logger = logging.getLogger("uvicorn.info")
 # Internal helper — reuse the same Supabase client from services
 # ---------------------------------------------------------------------------
 
-def _get_client():
-    from services.supabase_service import get_supabase_client  # pylint: disable=import-outside-toplevel
+def _get_client(service_role: bool = False):
+    from services.supabase_service import get_supabase_client, get_service_role_client  # pylint: disable=import-outside-toplevel
+    if service_role:
+        return get_service_role_client()
     return get_supabase_client()
+
+
+def _is_auth_failed() -> bool:
+    """Returns the circuit-breaker flag from supabase_service."""
+    try:
+        from services import supabase_service  # pylint: disable=import-outside-toplevel
+        return supabase_service._supabase_auth_failed  # pylint: disable=protected-access
+    except Exception:  # pylint: disable=broad-except
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +68,9 @@ async def upsert_steps(steps: List[EvalStep]) -> None:
     ]
 
     def _sync() -> None:
-        client = _get_client()
+        if _is_auth_failed():
+            return  # Circuit open — skip silently
+        client = _get_client(service_role=True)
         try:
             client.table("eval_steps").upsert(records).execute()
             logger.info("[EvalStore] Upserted %d eval_steps rows", len(records))
@@ -96,7 +109,9 @@ async def upsert_run_metrics(metrics: EvalRunMetrics) -> None:
     }
 
     def _sync() -> None:
-        client = _get_client()
+        if _is_auth_failed():
+            return  # Circuit open — skip silently
+        client = _get_client(service_role=True)
         try:
             client.table("eval_metrics").upsert(record).execute()
             logger.info(
@@ -140,7 +155,12 @@ async def list_run_metrics(
     difficulty: str | None = None,
     mode: str | None = None,
 ) -> List[Dict[str, Any]]:
-    """Fetches eval_metrics rows joined with basic agent_run info.
+    """Fetches eval_metrics rows enriched with basic agent_run info.
+
+    Uses a two-query approach instead of the PostgREST implicit-join syntax
+    ``agent_runs(...)`` which requires a declared FK constraint in the schema
+    cache (PGRST200 if the constraint is missing).  This makes the function
+    resilient both before and after the FK migration is applied.
 
     Args:
         limit:      Max rows (1–100).
@@ -148,17 +168,18 @@ async def list_run_metrics(
         mode:       Optional filter — ``"live"`` or ``"batch"``.
 
     Returns:
-        List of eval_metrics rows ordered newest first.
+        List of eval_metrics rows ordered newest first, each optionally
+        enriched with ``agent_runs`` sub-keys.
     """
 
     def _sync() -> List[Dict[str, Any]]:
         client = _get_client()
+
+        # ── 1. Fetch eval_metrics (no join) ───────────────────────────────────
         try:
             q = (
                 client.table("eval_metrics")
-                .select(
-                    "*, agent_runs(query, status, created_at, completed_at, rounds)"
-                )
+                .select("*")
                 .order("created_at", desc=True)
                 .limit(limit)
             )
@@ -167,10 +188,38 @@ async def list_run_metrics(
             if mode:
                 q = q.eq("mode", mode)
             resp = q.execute()
-            return resp.data or []
+            rows: List[Dict[str, Any]] = resp.data or []
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("[EvalStore] Could not list eval_metrics: %s", exc)
             return []
+
+        if not rows:
+            return rows
+
+        # ── 2. Enrich with agent_runs data in a separate query ────────────────
+        run_ids = [r["run_id"] for r in rows if r.get("run_id")]
+        run_map: Dict[str, Any] = {}
+        if run_ids:
+            try:
+                runs_resp = (
+                    client.table("agent_runs")
+                    .select("id, query, status, created_at, completed_at, rounds")
+                    .in_("id", run_ids)
+                    .execute()
+                )
+                for run in (runs_resp.data or []):
+                    run_map[run["id"]] = run
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning(
+                    "[EvalStore] Could not enrich eval_metrics with agent_runs: %s", exc
+                )
+
+        # Merge: embed run info under the "agent_runs" key to preserve the
+        # same response shape that the frontend / eval_routes already expect.
+        for row in rows:
+            row["agent_runs"] = run_map.get(row.get("run_id", ""), {})
+
+        return rows
 
     return await asyncio.get_running_loop().run_in_executor(None, _sync)
 

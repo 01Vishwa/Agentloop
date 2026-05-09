@@ -31,6 +31,7 @@ from eval.eval_logger import EvalLogger
 
 from core.config import MAX_AGENT_ROUNDS
 from core.ds_star_orchestrator import DsStarOrchestrator
+from services.upload_service import clear_file_cache
 
 logger = logging.getLogger("uvicorn.info")
 
@@ -157,7 +158,7 @@ async def handle_agent_run(
     orchestrator = _get_orchestrator(max_rounds, model, coder_model, temperature)
 
     # Persist new run row — non-blocking
-    await _try_create_run(run_id, _session_id, query, context, workspace_id)
+    await _try_create_run(run_id, _session_id, query, context, workspace_id, user_id)
 
     # Eval sidecar — passive observer, zero orchestration changes
     eval_logger = EvalLogger(run_id=run_id, query=query)
@@ -216,6 +217,7 @@ async def handle_agent_run(
         if monitor_task is not None:
             monitor_task.cancel()
         await eval_logger.finalize()  # ← eval sidecar: flush to Supabase
+        clear_file_cache(_session_id)  # FIX 3: free uploaded file bytes on stream close
         yield "data: {\"event\": \"stream_end\", \"payload\": {}}\n\n"
 
 
@@ -229,6 +231,7 @@ async def _try_create_run(
     query: str,
     context: Dict[str, Any],
     workspace_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> None:
     """Attempts to create an agent_runs row in Supabase.
 
@@ -245,6 +248,7 @@ async def _try_create_run(
         await create_agent_run(
             run_id=run_id,
             session_id=session_id,
+            user_id=user_id,
             query=query,
             file_names=file_names,
             workspace_id=workspace_id,

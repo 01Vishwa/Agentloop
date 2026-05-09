@@ -10,9 +10,9 @@ Gap fixes applied:
   a more precise pattern that won't fire on comments/strings.
 """
 
+import asyncio
 import logging
 import re
-import threading
 from typing import Any, Dict, List, Optional
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -70,11 +70,20 @@ HARD FAILURE RULES (any of these means is_sufficient = False):
    "<ExceptionType>Error:" — this is a crash and is NEVER sufficient.
 2. The execution output contains a bare "nan" or "NaN" for a requested
    calculation WITHOUT a printed explanation of why it is NaN.
-3. The code produced no output AND no artifact files were created.
+3. TASK-TYPE-AWARE empty-output check:
+   - For INSIGHT or DATA WRANGLING tasks (plan steps contain verbs like
+     'compute', 'print', 'calculate', 'count', 'filter', 'clean', 'merge'):
+     The code must have printed something to stdout AND/OR saved artifact files.
+     No output of any kind is ALWAYS a failure for these task types.
+   - For VISUALIZATION tasks (plan steps contain 'plot', 'chart', 'histogram',
+     'scatter', 'bar chart', 'visualize', 'save figure', 'distribution'):
+     Producing one or more artifact files (.png/.jpg/.svg/.html) is SUFFICIENT output
+     even if stdout is empty or minimal.
 
 ARTIFACT AWARENESS (important for visualization tasks):
-- If the plan required a PLOT/CHART and one or more .png / .jpg artifact files
+- If the plan required a PLOT/CHART and one or more .png / .jpg / .html / .svg artifact files
   were produced, treat this as sufficient output — even if stdout is minimal.
+- Plotly charts are saved as .html files (interactive) — these count as valid visualizations.
 - Artifact files are listed under "PRODUCED ARTIFACTS" below.
 
 Evaluation criteria (only apply if no hard failures):
@@ -131,23 +140,26 @@ class VerifierAgent:
         self._model = model
         self._temperature = temperature if temperature is not None else 0.1
         self._chain = None  # lazily built
-        self._lock = threading.Lock()  # thread-safe lazy init
+        self._lock = asyncio.Lock()  # async-safe lazy init
 
-    def _get_chain(self):
-        """Builds and caches the structured-output LangChain pipeline."""
-        with self._lock:
-            if self._chain is None:
-                from core.llm_client import get_nim_llm  # pylint: disable=import-outside-toplevel
-                llm = get_nim_llm(model=self._model, temperature=self._temperature)
-                structured_llm = llm.with_structured_output(VerifierOutput)
-                self._chain = (
-                    ChatPromptTemplate.from_messages([
-                        ("system", _VERIFIER_SYSTEM),
-                        ("human", _VERIFIER_HUMAN),
-                    ])
-                    | structured_llm
-                )
-        return self._chain
+    def _build_chain(self):
+        """Builds (but does NOT cache) the LangChain pipeline.
+
+        Heavy work — LLM init, imports — happens here, OUTSIDE the async lock.
+        """
+        from core.llm_client import get_structured_llm  # pylint: disable=import-outside-toplevel
+        structured_llm = get_structured_llm(
+            model=self._model,
+            schema=VerifierOutput,
+            temperature=self._temperature,
+        )
+        return (
+            ChatPromptTemplate.from_messages([
+                ("system", _VERIFIER_SYSTEM),
+                ("human", _VERIFIER_HUMAN),
+            ])
+            | structured_llm
+        )
 
     async def verify(
         self,
@@ -192,7 +204,14 @@ class VerifierAgent:
             else "  (none)"
         )
 
-        result: VerifierOutput = await self._get_chain().ainvoke(
+        if self._chain is None:
+            built = self._build_chain()      # heavy work — no lock held
+            async with self._lock:
+                if self._chain is None:      # double-checked locking
+                    self._chain = built
+        chain = self._chain
+
+        result: VerifierOutput = await chain.ainvoke(
             {
                 "query": query,
                 "data_description": data_description,

@@ -1,15 +1,19 @@
 /**
- * HistoryPanel.jsx — Collapsible past-run history drawer (fix #6).
+ * HistoryPanel.jsx — Collapsible past-run history drawer.
  *
- * Lists agent runs from Supabase with timestamp, query snippet, and
- * status badge. Clicking a row calls loadRun(id) to restore full state.
+ * Lists agent runs from Supabase scoped to the currently active project
+ * (workspace). Clicking a row calls loadRun(id) to restore full state.
+ *
+ * Per-project isolation: history is fetched with workspace_id so each
+ * project maintains a completely separate run history.
  */
 
 import React, { useEffect, useState } from 'react'
 import {
   History, ChevronDown, ChevronUp, CheckCircle2,
-  XCircle, Loader2, Clock, RefreshCw,
+  XCircle, Loader2, Clock, RefreshCw, FolderKanban,
 } from 'lucide-react'
+import { useWorkspaceStore } from '../../stores/workspaceStore'
 
 // ─── Status badge ────────────────────────────────────────────────────────────
 function StatusBadge({ status }) {
@@ -110,11 +114,13 @@ function RunRow({ run, onLoad, isLoading }) {
 export function HistoryPanel({ historyRuns, historyLoading, fetchHistory, loadRun }) {
   const [collapsed, setCollapsed] = useState(false)
   const [loadingId, setLoadingId] = useState(null)
+  const { activeWorkspace } = useWorkspaceStore()
 
-  // Fetch on first mount (when panel becomes visible)
+  // Fetch history when the component mounts OR when the active project changes.
+  // force=true bypasses the 15s throttle so project switches show fresh history immediately.
   useEffect(() => {
-    fetchHistory()
-  }, [fetchHistory])
+    fetchHistory(20, true)
+  }, [fetchHistory, activeWorkspace?.id])
 
   const handleLoad = async (runId) => {
     setLoadingId(runId)
@@ -136,11 +142,21 @@ export function HistoryPanel({ historyRuns, historyLoading, fetchHistory, loadRu
             <History size={14} className="text-slate-500" />
           </div>
           <div className="text-left">
-            <p className="text-[13px] font-bold text-slate-800">Run History</p>
+            <div className="flex items-center gap-2">
+              <p className="text-[13px] font-bold text-slate-800">Run History</p>
+              {activeWorkspace?.name && (
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md
+                                 bg-brand-50 border border-brand-100 text-[10px] font-semibold
+                                 text-brand-600 max-w-[120px] truncate">
+                  <FolderKanban size={9} />
+                  {activeWorkspace.name}
+                </span>
+              )}
+            </div>
             <p className="text-[11px] text-slate-500 font-medium">
               {historyLoading
                 ? 'Loading…'
-                : `${historyRuns.length} past run${historyRuns.length !== 1 ? 's' : ''}`}
+                : `${historyRuns.length} past run${historyRuns.length !== 1 ? 's' : ''} in this project`}
             </p>
           </div>
         </div>
@@ -149,8 +165,8 @@ export function HistoryPanel({ historyRuns, historyLoading, fetchHistory, loadRu
           <span
             role="button"
             tabIndex={0}
-            onClick={(e) => { e.stopPropagation(); fetchHistory() }}
-            onKeyDown={(e) => e.key === 'Enter' && fetchHistory()}
+            onClick={(e) => { e.stopPropagation(); fetchHistory(20, true) }}
+            onKeyDown={(e) => e.key === 'Enter' && fetchHistory(20, true)}
             className="w-6 h-6 flex items-center justify-center rounded-full
                        bg-slate-50 border border-slate-200 text-slate-400
                        hover:text-brand-500 hover:border-brand-200 transition-colors"
@@ -176,7 +192,7 @@ export function HistoryPanel({ historyRuns, historyLoading, fetchHistory, loadRu
             </div>
           ) : historyRuns.length === 0 ? (
             <div className="text-center py-8 text-[12px] text-slate-400 font-medium">
-              No past runs yet. Submit a query to get started.
+              No runs in this project yet. Submit a query to get started.
             </div>
           ) : (
             historyRuns.map((run) => (

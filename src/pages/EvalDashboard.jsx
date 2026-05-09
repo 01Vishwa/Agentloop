@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
+import { ThemeToggle } from '../components/shared/ThemeToggle'
+import { useAuth } from '../contexts/AuthContext'
 import { KpiCard } from '../components/eval/KpiCard'
 import { AgentTable } from '../components/eval/AgentTable'
 import { RunList } from '../components/eval/RunList'
@@ -65,6 +67,15 @@ export function EvalDashboard() {
   const [loading,    setLoading]    = useState(true)
   const [activeSection, setActiveSection] = useState('overview')
 
+  const { isAuthenticated, loading: authLoading, getAccessToken } = useAuth()
+  const navigate = useNavigate()
+
+  useEffect(() => {
+    if (!authLoading && !isAuthenticated) {
+      navigate('/', { replace: true })
+    }
+  }, [authLoading, isAuthenticated, navigate])
+
   const sectionRefs = {
     overview:    useRef(null),
     performance: useRef(null),
@@ -77,11 +88,12 @@ export function EvalDashboard() {
     async function load() {
       try {
         setLoading(true)
+        const token = getAccessToken()
         const [ov, ag, ds, rl] = await Promise.all([
-          getOverview(),
-          getAgentPerformance(),
-          getDebugLoopStats(),
-          listEvalRuns(),
+          getOverview(token),
+          getAgentPerformance(token),
+          getDebugLoopStats(token),
+          listEvalRuns({}, token),
         ])
         setOverview(ov)
         setAgents(ag)
@@ -94,15 +106,16 @@ export function EvalDashboard() {
       }
     }
     load()
-  }, [])
+  }, [getAccessToken])
 
   /* ── Trace load when run selected ── */
   useEffect(() => {
     if (!selectedRunId) { setTraceData(null); return }
-    getRunTrace(selectedRunId)
+    const token = getAccessToken()
+    getRunTrace(selectedRunId, token)
       .then(setTraceData)
       .catch(() => setTraceData(null))
-  }, [selectedRunId])
+  }, [selectedRunId, getAccessToken])
 
   /* ── IntersectionObserver to track active section ── */
   useEffect(() => {
@@ -180,11 +193,12 @@ export function EvalDashboard() {
           </div>
 
           {/* Section nav pills */}
-          <nav className="hidden md:flex items-center gap-1">
-            {NAV_SECTIONS.map(({ id, label, icon: Icon }) => (
-              <button
-                key={id}
-                onClick={() => scrollTo(id)}
+          <div className="hidden md:flex items-center gap-4">
+            <nav className="flex items-center gap-1">
+              {NAV_SECTIONS.map(({ id, label, icon: Icon }) => (
+                <button
+                  key={id}
+                  onClick={() => scrollTo(id)}
                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
                   activeSection === id
                     ? 'bg-violet-100 text-violet-700'
@@ -195,7 +209,9 @@ export function EvalDashboard() {
                 {label}
               </button>
             ))}
-          </nav>
+            </nav>
+            <ThemeToggle />
+          </div>
         </div>
       </header>
 

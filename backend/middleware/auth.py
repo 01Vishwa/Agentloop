@@ -5,9 +5,15 @@ Extracts and verifies the Supabase-issued JWT from the
 authenticated user's ID and email into the route context via FastAPI's
 dependency injection system.
 
+Only ES256 (asymmetric JWKS) is accepted:
+  - ES256: Supabase newer projects use asymmetric keys. Public key is fetched
+           from {SUPABASE_URL}/auth/v1/.well-known/jwks.json and cached in memory.
+  - HS256 fallback has been removed (algorithm confusion attack surface).
+
+Audience claim ``"authenticated"`` is enforced on every token.
+
 All configuration is read from ``core.config`` — no credentials are
-hard-coded here. The JWT secret is loaded from the ``SUPABASE_JWT_SECRET``
-environment variable.
+hard-coded here.
 
 Usage in a route::
 
@@ -27,16 +33,69 @@ Optional / soft-auth usage (returns None when unauthenticated)::
 """
 
 import logging
-from typing import Optional
+import time
+from typing import Dict, Optional, Any
 
 import jwt
+import httpx
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
-from core.config import SUPABASE_JWT_SECRET
+from core.config import SUPABASE_URL, SUPABASE_JWT_SECRET  # noqa: F401
 
 logger = logging.getLogger("uvicorn.error")
+
+# ---------------------------------------------------------------------------
+# JWKS key cache (for ES256 / asymmetric verification)
+# ---------------------------------------------------------------------------
+
+_jwks_cache: Dict[str, Any] = {}  # kid → public key object
+_jwks_fetched_at: float = 0.0
+_JWKS_TTL_SECONDS: int = 3600  # re-fetch JWKS every hour
+
+
+def _get_jwks_key(kid: str) -> Optional[Any]:
+    """Returns the public key matching ``kid`` from Supabase's JWKS endpoint.
+
+    Results are cached in-process for ``_JWKS_TTL_SECONDS`` to avoid
+    hammering the JWKS endpoint on every request.
+
+    Args:
+        kid: The ``kid`` (key ID) from the JWT header.
+
+    Returns:
+        A PyJWT-compatible public key object, or ``None`` if not found.
+    """
+    global _jwks_cache, _jwks_fetched_at
+
+    now = time.monotonic()
+    if not _jwks_cache or (now - _jwks_fetched_at) > _JWKS_TTL_SECONDS:
+        if not SUPABASE_URL:
+            logger.error("[Auth] SUPABASE_URL is not set — cannot fetch JWKS.")
+            return None
+        jwks_url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/.well-known/jwks.json"
+        try:
+            resp = httpx.get(jwks_url, timeout=5.0)
+            resp.raise_for_status()
+            jwks_data = resp.json()
+            new_cache: Dict[str, Any] = {}
+            for key_data in jwks_data.get("keys", []):
+                key_kid = key_data.get("kid", "")
+                try:
+                    public_key = jwt.algorithms.ECAlgorithm.from_jwk(key_data)
+                    new_cache[key_kid] = public_key
+                    logger.info("[Auth] Loaded JWKS public key: kid=%s", key_kid)
+                except Exception as exc:
+                    logger.warning("[Auth] Could not parse JWKS key kid=%s: %s", key_kid, exc)
+            _jwks_cache = new_cache
+            _jwks_fetched_at = now
+            logger.info("[Auth] JWKS refreshed — %d key(s) loaded", len(_jwks_cache))
+        except Exception as exc:
+            logger.error("[Auth] Failed to fetch JWKS from %s: %s", jwks_url, exc)
+            # Keep stale cache on error rather than crashing
+
+    return _jwks_cache.get(kid)
 
 # ---------------------------------------------------------------------------
 # HTTP Bearer extractor (FastAPI built-in)
@@ -71,10 +130,9 @@ class AuthUser(BaseModel):
 def _decode_supabase_jwt(token: str) -> dict:
     """Decodes and verifies a Supabase-issued JWT.
 
-    Uses PyJWT with the HS256 algorithm and the ``SUPABASE_JWT_SECRET``
-    configured in ``core.config``. The audience is not validated here
-    because Supabase tokens use ``"authenticated"`` as the role claim
-    rather than a standard audience value.
+    Accepts ONLY ES256 (asymmetric JWKS) tokens. HS256 is explicitly rejected
+    to eliminate algorithm confusion attacks. The audience claim is enforced
+    to ``"authenticated"``.
 
     Args:
         token: Raw JWT string (without the ``Bearer `` prefix).
@@ -83,25 +141,59 @@ def _decode_supabase_jwt(token: str) -> dict:
         Decoded JWT payload dict.
 
     Raises:
-        HTTPException 401: If the token is missing, expired, or invalid.
-        HTTPException 500: If ``SUPABASE_JWT_SECRET`` is not configured.
+        HTTPException 401: If the token is missing, expired, invalid,
+            uses a disallowed algorithm, or fails audience validation.
+        HTTPException 500: If the JWKS key cannot be resolved.
     """
-    if not SUPABASE_JWT_SECRET:
-        logger.error(
-            "[Auth] SUPABASE_JWT_SECRET is not set — cannot verify JWTs. "
-            "Add it to backend/.env and restart the server."
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Auth service misconfigured: JWT secret missing.",
-        )
-
     try:
+        unverified_header = jwt.get_unverified_header(token)
+        alg = unverified_header.get("alg", "")
+
+        # Accept ES256 (preferred) and HS256 (legacy/local-dev) when configured.
+        if alg == "HS256":
+            if not SUPABASE_JWT_SECRET:
+                logger.error("[Auth] SUPABASE_JWT_SECRET is not set — cannot verify HS256 JWT.")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Server misconfigured for HS256 JWT verification.",
+                )
+            payload = jwt.decode(
+                token,
+                SUPABASE_JWT_SECRET,
+                algorithms=["HS256"],
+                audience="authenticated",
+                options={"verify_aud": True},
+            )
+            return payload
+
+        if alg != "ES256":
+            logger.warning("[Auth] Rejected token with disallowed algorithm: %s", alg)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token algorithm not permitted.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # Asymmetric ES256 — resolve public key via JWKS
+        kid = unverified_header.get("kid", "")
+        public_key = _get_jwks_key(kid)
+        if public_key is None:
+            logger.error(
+                "[Auth] No JWKS key found for kid=%s (alg=%s). "
+                "Check SUPABASE_URL and ensure the JWKS endpoint is reachable.",
+                kid, alg,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not resolve JWT signing key.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         payload = jwt.decode(
             token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            options={"verify_aud": False},
+            public_key,
+            algorithms=["ES256"],
+            audience="authenticated",
+            options={"verify_aud": True},
         )
         return payload
     except jwt.ExpiredSignatureError:
@@ -110,8 +202,14 @@ def _decode_supabase_jwt(token: str) -> dict:
             detail="Token has expired. Please sign in again.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    except HTTPException:
+        raise
     except jwt.InvalidTokenError as exc:
-        logger.warning("[Auth] Invalid JWT: %s", exc)
+        try:
+            unverified_header = jwt.get_unverified_header(token)
+            logger.warning("[Auth] Invalid JWT: %s, header: %s", exc, unverified_header)
+        except Exception:
+            logger.warning("[Auth] Invalid JWT: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication token.",

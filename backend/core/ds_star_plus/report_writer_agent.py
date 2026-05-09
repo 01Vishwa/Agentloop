@@ -11,8 +11,8 @@ Architecture position:
     [parallel DS-STAR results] → ReportWriter → structured markdown report
 """
 
+import asyncio
 import logging
-import threading
 from typing import Any, Dict, List, Optional
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -90,12 +90,30 @@ STRICT RULES:
    It must accurately represent the body, not guess at results.
 """
 
-_WRITER_HUMAN = """\
+_WRITER_HUMAN_INITIAL = """\
 ORIGINAL RESEARCH QUERY:
 {query}
 
 SUB-QUESTIONS AND THEIR RESULTS:
 {qa_pairs}
+"""
+
+# Refinement variant: writer receives the draft + supplementary evidence
+_WRITER_HUMAN_REFINEMENT = """\
+ORIGINAL RESEARCH QUERY:
+{query}
+
+INITIAL DRAFT REPORT:
+{draft_report}
+
+SUPPLEMENTARY QUESTIONS AND THEIR RESULTS (integrate these into the report):
+{supplementary_qa}
+
+INSTRUCTION: Revise and enhance the Initial Draft Report by integrating the
+Supplementary findings above. Do not discard any finding from the draft.
+Add new sections or expand existing sections where the supplementary results
+add value. Re-derive the executive summary and key_findings to reflect all
+evidence (initial + supplementary). Every claim must still cite [Qn] notation.
 """
 
 
@@ -162,43 +180,58 @@ class ReportWriterAgent:
         self._model = model
         self._temperature = temperature if temperature is not None else 0.1
         self._chain = None
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()  # async-safe lazy init
 
-    def _get_chain(self):
-        """Builds and caches the structured-output LangChain pipeline."""
-        with self._lock:
-            if self._chain is None:
-                from core.llm_client import get_structured_llm  # pylint: disable=import-outside-toplevel
-                from core.config import NIM_MODEL_FLASH  # pylint: disable=import-outside-toplevel
-                resolved = self._model or NIM_MODEL_FLASH
-                structured_llm = get_structured_llm(
-                    model=resolved,
-                    schema=ReportOutput,
-                    temperature=self._temperature,
-                )
-                self._chain = (
-                    ChatPromptTemplate.from_messages([
-                        ("system", _WRITER_SYSTEM),
-                        ("human", _WRITER_HUMAN),
-                    ])
-                    | structured_llm
-                )
-        return self._chain
+    def _build_chain(self, refinement: bool = False):
+        """Builds (but does NOT cache) the LangChain pipeline.
+
+        Heavy work — LLM init, imports — happens here, OUTSIDE the async lock.
+
+        Args:
+            refinement: If True, uses the refinement prompt that accepts a
+                draft_report and supplementary_qa (DS-STAR+ iterative phase).
+        """
+        from core.llm_client import get_structured_llm  # pylint: disable=import-outside-toplevel
+        from core.config import NIM_MODEL_FLASH  # pylint: disable=import-outside-toplevel
+        resolved = self._model or NIM_MODEL_FLASH
+        structured_llm = get_structured_llm(
+            model=resolved,
+            schema=ReportOutput,
+            temperature=self._temperature,
+        )
+        human_template = _WRITER_HUMAN_REFINEMENT if refinement else _WRITER_HUMAN_INITIAL
+        return (
+            ChatPromptTemplate.from_messages([
+                ("system", _WRITER_SYSTEM),
+                ("human", human_template),
+            ])
+            | structured_llm
+        )
 
     async def write(
         self,
         query: str,
         sub_questions: List[str],
         results: List[Dict[str, Any]],
+        draft_report: Optional[str] = None,
+        supplementary_questions: Optional[List[str]] = None,
+        supplementary_results: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Generates the final research report from sub-question results.
 
+        When ``draft_report`` + ``supplementary_questions`` + ``supplementary_results``
+        are provided, operates in REFINEMENT mode (DS-STAR+ iterative phase):
+        the writer integrates the supplementary evidence into the existing draft
+        rather than writing from scratch. This implements the paper's Report Writer
+        agent behaviour during the iterative refinement step.
+
         Args:
             query: The original open-ended research query.
-            sub_questions: Ordered list of atomic sub-questions.
-            results: Ordered list of DS-STAR result dicts (one per
-                sub-question). Each dict should contain ``execution_output``,
-                ``insights``, and ``status`` keys.
+            sub_questions: Ordered list of atomic sub-questions (initial round).
+            results: Ordered list of DS-STAR result dicts (initial round).
+            draft_report: Optional. The initial report body for refinement mode.
+            supplementary_questions: Optional. Gap-filling sub-questions (refinement).
+            supplementary_results: Optional. DS-STAR results for supplementary Qs.
 
         Returns:
             Dict with keys:
@@ -208,18 +241,50 @@ class ReportWriterAgent:
                 - ``key_findings`` (List[str]): Top 3–7 cited findings.
                 - ``caveats`` (List[str]): Data quality issues (if any).
         """
-        qa_pairs = _format_qa_pairs(sub_questions, results)
-
-        result: ReportOutput = await self._get_chain().ainvoke({
-            "query": query,
-            "qa_pairs": qa_pairs,
-        })
-
-        logger.info(
-            "[ReportWriter] title=%s | findings=%d | caveats=%d",
-            result.title[:60],
-            len(result.key_findings),
-            len(result.caveats),
+        is_refinement = (
+            bool(draft_report)
+            and bool(supplementary_questions)
+            and bool(supplementary_results)
         )
+
+        if is_refinement:
+            # ── Refinement mode ───────────────────────────────────────────────────
+            supplementary_qa = _format_qa_pairs(
+                supplementary_questions,  # type: ignore[arg-type]
+                supplementary_results,    # type: ignore[arg-type]
+            )
+            refinement_chain = self._build_chain(refinement=True)
+            result: ReportOutput = await refinement_chain.ainvoke({
+                "query": query,
+                "draft_report": draft_report,
+                "supplementary_qa": supplementary_qa,
+            })
+            logger.info(
+                "[ReportWriter] Refinement complete | title=%s | findings=%d | caveats=%d",
+                result.title[:60],
+                len(result.key_findings),
+                len(result.caveats),
+            )
+        else:
+            # ── Initial mode ─────────────────────────────────────────────────────────
+            qa_pairs = _format_qa_pairs(sub_questions, results)
+
+            if self._chain is None:
+                built = self._build_chain()      # heavy work — no lock held
+                async with self._lock:
+                    if self._chain is None:      # double-checked locking
+                        self._chain = built
+            chain = self._chain
+
+            result = await chain.ainvoke({
+                "query": query,
+                "qa_pairs": qa_pairs,
+            })
+            logger.info(
+                "[ReportWriter] Initial write | title=%s | findings=%d | caveats=%d",
+                result.title[:60],
+                len(result.key_findings),
+                len(result.caveats),
+            )
 
         return result.model_dump()
