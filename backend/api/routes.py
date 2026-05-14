@@ -109,17 +109,9 @@ def _set_session(key: str, data: Dict[str, Any]) -> None:
 
 import asyncio
 
-@router.on_event("startup")
-async def start_session_eviction_loop():
-    """Starts a background loop to continuously evict stale sessions."""
-    async def eviction_loop():
-        while True:
-            await asyncio.sleep(60)
-            try:
-                _evict_stale_sessions()
-            except Exception as e:
-                logger.error("[Router] Eviction loop error: %s", e)
-    asyncio.create_task(eviction_loop())
+# B2 fix: @router.on_event("startup") silently no-ops on APIRouter — the
+# eviction loop is registered on the FastAPI app instance in main.py instead.
+# See: _start_session_eviction_loop() in main.py.
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +183,11 @@ async def process_batch(
         session_key[:8],
         len(request.files),
     )
-    result = handle_process(request.files, session_id=session_key)
+    # B7 fix: handle_process is a blocking sync function (CSV/PDF parsing).
+    # Run it in a thread-pool executor so it doesn't stall the event loop
+    # and block SSE heartbeats from other concurrent requests.
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, handle_process, request.files, session_key)
 
     existing = _session_contexts.get(session_key, {})
     new_details = result.get("details", {})
@@ -396,7 +392,20 @@ async def download_run(
                 
             zip_file.writestr("results.md", md_content)
             
-            all_text = "\n".join(execution_logs) + "\n" + "\n".join(insights)
+            # B1 fix: "\n".join(dict) only iterates over keys, not values.
+            # Flatten insights into searchable text regardless of its shape.
+            if isinstance(insights, dict):
+                _parts: List[str] = []
+                if insights.get("summary"):
+                    _parts.append(str(insights["summary"]))
+                for b in (insights.get("bullets") or []):
+                    _parts.append(str(b))
+                insights_text = "\n".join(_parts)
+            elif isinstance(insights, list):
+                insights_text = "\n".join(str(i) for i in insights)
+            else:
+                insights_text = ""
+            all_text = "\n".join(execution_logs) + "\n" + insights_text
             base64_pattern = re.compile(r"data:image/(png|jpeg|jpg);base64,([A-Za-z0-9+/=]+)")
             matches = base64_pattern.findall(all_text)
             

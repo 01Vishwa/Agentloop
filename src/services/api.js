@@ -98,7 +98,7 @@ export async function uploadFiles(files, onProgress, sessionId = '', accessToken
       } else {
         try {
           const errData = JSON.parse(xhr.responseText)
-          reject(new Error(errData.message || `Upload failed with status ${xhr.status}`))
+          reject(new Error(errData.detail || errData.message || `Upload failed with status ${xhr.status}`))
         } catch (e) {
           reject(new Error(`Upload failed with status ${xhr.status}`))
         }
@@ -137,7 +137,7 @@ export async function processFiles(filenames, sessionId = '', accessToken = null
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({ message: `HTTP ${res.status}` }))
-    throw new Error(err.message || `Process failed with status ${res.status}`)
+    throw new Error(err.detail || err.message || `Process failed with status ${res.status}`)
   }
 
   return res.json()

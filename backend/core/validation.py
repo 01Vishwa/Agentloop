@@ -72,7 +72,25 @@ async def validate_file_metadata(
     expected_mime = ALLOWED_MIME_TYPES[ext]
     actual_mime = file.content_type
 
-    if actual_mime != expected_mime:
+    # B3 fix: Normalise known browser MIME aliases before comparing.
+    # Different OS/browser combinations report different MIME strings for the
+    # same file format (e.g. Windows Chrome sends application/vnd.ms-excel for
+    # .csv). Map these to their canonical equivalents first.
+    _BROWSER_MIME_ALIASES: dict = {
+        "application/vnd.ms-excel":    "text/csv",       # Windows Chrome/Edge for .csv
+        "application/csv":             "text/csv",
+        "text/comma-separated-values": "text/csv",
+        "application/x-json":          "application/json",
+        "text/x-json":                 "application/json",
+    }
+    actual_mime = _BROWSER_MIME_ALIASES.get(actual_mime, actual_mime)
+
+    # If the browser reports a truly generic type (octet-stream, text/plain,
+    # or nothing at all), skip the MIME check entirely and let magic-byte
+    # sniffing be the authoritative gate — do not reject prematurely.
+    _GENERIC_MIMES = {"application/octet-stream", "text/plain", None, ""}
+
+    if actual_mime not in _GENERIC_MIMES and actual_mime != expected_mime:
         return f"MIME mismatch (Got {actual_mime}, expected {expected_mime})."
 
     # Magic-byte sniff — detect spoofed Content-Type / extension (MIN-04)
