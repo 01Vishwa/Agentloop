@@ -22,6 +22,8 @@ export function ProjectsPage() {
 
   const [searchQuery, setSearchQuery] = useState('')
   const [sortConfig, setSortConfig] = useState({ key: 'created_at', direction: 'desc' })
+  const [currentPage, setCurrentPage] = useState(1)
+  const itemsPerPage = 10
 
   // Filtering and Sorting logic
   const filteredAndSortedWorkspaces = useMemo(() => {
@@ -63,6 +65,18 @@ export function ProjectsPage() {
       direction: prev.key === key && prev.direction === 'asc' ? 'desc' : 'asc'
     }))
   }
+
+  // Reset page to 1 when search query changes
+  useEffect(() => {
+    setCurrentPage(1)
+  }, [searchQuery])
+
+  // Pagination logic
+  const totalPages = Math.ceil(filteredAndSortedWorkspaces.length / itemsPerPage)
+  const paginatedWorkspaces = useMemo(() => {
+    const startIndex = (currentPage - 1) * itemsPerPage
+    return filteredAndSortedWorkspaces.slice(startIndex, startIndex + itemsPerPage)
+  }, [filteredAndSortedWorkspaces, currentPage, itemsPerPage])
 
   const SortIcon = ({ sortKey }) => {
     if (sortConfig.key !== sortKey) return <ArrowUpDown size={14} className="text-slate-300 opacity-0 group-hover:opacity-100 transition-opacity ml-1 inline-block" />
@@ -168,7 +182,6 @@ export function ProjectsPage() {
         <div className="flex items-center justify-between mb-10">
           <div>
             <h1 className="text-3xl font-extrabold text-slate-900 tracking-tight">Your Projects</h1>
-            <p className="text-slate-500 mt-2">Each project maintains its own files, run history, and analysis context.</p>
           </div>
           <button
             onClick={() => setIsCreating(true)}
@@ -244,10 +257,10 @@ export function ProjectsPage() {
         ) : (
           !isCreating && (
             <div className="glass-card-elevated overflow-hidden border border-slate-200 bg-white shadow-sm rounded-2xl">
-              <div className="overflow-x-auto">
+              <div className="overflow-x-auto overflow-y-auto max-h-[60vh]">
                 <table className="w-full text-left border-collapse min-w-[700px]">
-                  <thead>
-                    <tr className="border-b border-slate-200 bg-slate-50/50">
+                  <thead className="sticky top-0 z-10 shadow-sm">
+                    <tr className="border-b border-slate-200 bg-slate-50">
                       <th className="p-4 font-semibold text-slate-600 text-sm cursor-pointer group hover:bg-slate-100 transition-colors w-[35%]" onClick={() => handleSort('name')}>
                         <div className="flex items-center">
                           Project Name
@@ -278,7 +291,7 @@ export function ProjectsPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredAndSortedWorkspaces.map((ws) => {
+                    {paginatedWorkspaces.map((ws) => {
                       const stats = wsStats[ws.id]
                       const runCount = stats?.run_count ?? 0
                       const lastRun = stats?.last_run_at
@@ -327,6 +340,32 @@ export function ProjectsPage() {
                   </tbody>
                 </table>
               </div>
+              {totalPages > 1 && (
+                <div className="px-6 py-4 border-t border-slate-200 bg-slate-50 flex items-center justify-between">
+                  <span className="text-sm text-slate-500">
+                    Showing {(currentPage - 1) * itemsPerPage + 1} to {Math.min(currentPage * itemsPerPage, filteredAndSortedWorkspaces.length)} of {filteredAndSortedWorkspaces.length} projects
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+                      disabled={currentPage === 1}
+                      className="px-3 py-1.5 text-sm font-medium rounded-lg border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    >
+                      Previous
+                    </button>
+                    <span className="text-sm font-medium text-slate-700 px-2">
+                      Page {currentPage} of {totalPages}
+                    </span>
+                    <button
+                      onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
+                      disabled={currentPage === totalPages}
+                      className="px-3 py-1.5 text-sm font-medium rounded-lg border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    >
+                      Next
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )
         )}

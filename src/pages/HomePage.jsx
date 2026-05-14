@@ -22,6 +22,7 @@ export function HomePage({ fileState, agentState }) {
     sessionId,
     handleAddFiles,
     handleConfirmDuplicates,
+    handleCancelDuplicates,
     handleRemoveFile,
     handleClearAll,
   } = fileState
@@ -246,7 +247,7 @@ export function HomePage({ fileState, agentState }) {
         isOpen={pendingDuplicates.length > 0}
         duplicates={pendingDuplicates}
         onConfirm={handleConfirmDuplicates}
-        onCancel={() => {}}
+        onCancel={handleCancelDuplicates}
       />
 
       <AuthModal

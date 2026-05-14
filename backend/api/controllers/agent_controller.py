@@ -217,7 +217,11 @@ async def handle_agent_run(
         if monitor_task is not None:
             monitor_task.cancel()
         await eval_logger.finalize()  # ← eval sidecar: flush to Supabase
-        clear_file_cache(_session_id)  # FIX 3: free uploaded file bytes on stream close
+        # File cache is retained across runs — users can run multiple queries on the
+        # same uploaded data without re-uploading. Cleanup is handled by:
+        #   • Explicit DELETE /api/clear (user action via handleClearAll)
+        #   • TTL eviction (_evict_stale_sessions every 60 s, ARCH-02)
+        #   • MAX_SESSIONS cap eviction
         yield "data: {\"event\": \"stream_end\", \"payload\": {}}\n\n"
 
 

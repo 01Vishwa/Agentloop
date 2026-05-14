@@ -192,7 +192,7 @@ async def list_uploaded_files(workspace_id: Optional[str] = None) -> List[Dict[s
         List[Dict[str, Any]]: List of dataset metadata rows.
     """
     def _sync() -> List[Dict[str, Any]]:
-        client = _make_anon_client()
+        client = _make_service_client()
         query = client.table("uploaded_files").select("*").order("created_at", desc=True)
         if workspace_id:
             query = query.eq("workspace_id", workspace_id)
@@ -617,7 +617,7 @@ async def list_workspaces(user_id: str) -> List[Dict[str, Any]]:
         List[Dict[str, Any]]: Workspace rows ordered by creation date.
     """
     def _sync() -> List[Dict[str, Any]]:
-        client = _make_anon_client()
+        client = _make_service_client()  # bypass RLS; eq("user_id") filters server-side
         try:
             response = (
                 client.table("workspaces")

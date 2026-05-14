@@ -30,6 +30,59 @@ const _generateSessionId = () =>
     : Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)
 
 /**
+ * Extracts columns from a file object or URL.
+ * Uses xlsx to parse both CSV and Excel files.
+ */
+const extractColumns = async (fileObj, filename, url = null) => {
+  const ext = filename.split('.').pop()?.toLowerCase()
+  
+  if (['csv', 'xlsx', 'xls'].includes(ext)) {
+    try {
+      let dataBuffer;
+      if (fileObj) {
+        dataBuffer = await fileObj.arrayBuffer();
+      } else if (url) {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error('Failed to fetch file');
+        dataBuffer = await res.arrayBuffer();
+      } else {
+        return null;
+      }
+
+      const XLSX = await import('xlsx');
+      const workbook = XLSX.read(dataBuffer, { type: 'array' });
+      const firstSheetName = workbook.SheetNames[0];
+      const worksheet = workbook.Sheets[firstSheetName];
+      const json = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+
+      if (json.length > 0) {
+        const headers = json[0];
+        const dataRow = json.length > 1 ? json[1] : null;
+
+        return headers.map((h, index) => {
+          let type = 'string';
+          if (dataRow && dataRow[index] !== undefined && dataRow[index] !== null) {
+            const val = dataRow[index];
+            if (typeof val === 'number') {
+              type = Number.isInteger(val) ? 'integer' : 'float';
+            } else if (typeof val === 'boolean') {
+              type = 'boolean';
+            } else if (val instanceof Date) {
+              type = 'datetime';
+            }
+          }
+          return { name: String(h || `Column ${index + 1}`), type };
+        });
+      }
+    } catch (err) {
+      console.error('Error extracting columns:', err);
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
  * Manages the full file lifecycle: adding, uploading, replacing duplicates, removing.
  *
  * Per-project isolation: when a projectId is present in the URL, the sessionId
@@ -69,14 +122,19 @@ export function useFileUpload() {
       })
       if (res.ok) {
         const data = await res.json()
-        setFiles(data.map((r, i) => ({
-          id: 10000 + i,
-          name: r.filename,
-          size: r.file_size,
-          progress: 100,
-          _raw: null,
-          url: r.file_url
-        })))
+        const formattedFiles = await Promise.all(data.map(async (r, i) => {
+          const columns = await extractColumns(null, r.filename, r.file_url)
+          return {
+            id: 10000 + i,
+            name: r.filename,
+            size: r.file_size,
+            progress: 100,
+            _raw: null,
+            url: r.file_url,
+            metadata: columns ? { columns } : null
+          }
+        }))
+        setFiles(formattedFiles)
       }
     } catch (err) {
       console.error(err)
@@ -124,12 +182,16 @@ export function useFileUpload() {
 
   const handleAddFiles = useCallback(
     async (newFiles) => {
-      const entries = newFiles.map((f) => ({
-        id: ++fileIdCounter,
-        name: f.name,
-        size: f.size,
-        progress: 0,
-        _raw: f,
+      const entries = await Promise.all(newFiles.map(async (f) => {
+        const columns = await extractColumns(f, f.name)
+        return {
+          id: ++fileIdCounter,
+          name: f.name,
+          size: f.size,
+          progress: 0,
+          _raw: f,
+          metadata: columns ? { columns } : null
+        }
       }))
 
       const existingNames = files.map((f) => f.name)
@@ -166,6 +228,10 @@ export function useFileUpload() {
     }
   }, [pendingDuplicates, startUploads])
 
+  const handleCancelDuplicates = useCallback(() => {
+    setPendingDuplicates([])
+  }, [])
+
   const handleRemoveFile = useCallback(
     (id) => {
       const file = files.find((f) => f.id === id)
@@ -192,6 +258,7 @@ export function useFileUpload() {
     sessionId,
     handleAddFiles,
     handleConfirmDuplicates,
+    handleCancelDuplicates,
     handleRemoveFile,
     handleClearAll,
   }

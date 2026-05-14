@@ -48,6 +48,31 @@ app.add_middleware(RequestLoggerMiddleware)
 
 app.add_exception_handler(Exception, global_exception_handler)
 
+from api.routes import _evict_stale_sessions as _evict_sessions
+
+
+@app.on_event("startup")
+async def _start_session_eviction_loop() -> None:
+    """B2 fix: Periodically evicts stale sessions every 60 s.
+
+    @router.on_event(\"startup\") silently no-ops on APIRouter; registering
+    the task here on the FastAPI app instance ensures it actually runs.
+    """
+    import asyncio as _asyncio
+    import logging as _log_mod
+    _l = _log_mod.getLogger("uvicorn.error")
+
+    async def _loop() -> None:
+        while True:
+            await _asyncio.sleep(60)
+            try:
+                _evict_sessions()
+            except Exception as exc:  # pylint: disable=broad-except
+                _l.error("[Router] Eviction loop error: %s", exc)
+
+    _asyncio.create_task(_loop())
+
+
 @app.on_event("startup")
 async def startup_event():
     """Validates configuration on startup and prints config health table."""
