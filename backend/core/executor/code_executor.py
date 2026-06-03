@@ -12,18 +12,27 @@ Security fixes applied:
 - Optional Docker sandbox path controlled by DOCKER_SANDBOX_ENABLED env flag
   (Gap 2 fix).  FAIL-CLOSED: raises RuntimeError when Docker is enabled but
   unavailable — no subprocess fallback is permitted in production.
+- BUG 1 (HIGH) fix: _run_popen_capped() now runs with:
+    * start_new_session=True so the entire child process group can be killed
+      atomically on timeout via os.killpg, preventing orphaned processes.
+    * _apply_resource_limits() as a preexec_fn that sets RLIMIT_CPU and
+      RLIMIT_AS (Unix only) to prevent runaway CPU/memory consumption.
+    * SandboxViolationError raised for any constraint breach, keeping raw
+      OS/subprocess details away from the LLM error context.
 
 Artifact MIME types extended to cover image formats and ML model files.
 """
 
 import asyncio
+import threading
 import base64
 import logging
 import os
+import signal
 import subprocess
 import sys
 import tempfile
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from core.config import (
     DOCKER_CPU_QUOTA,
@@ -31,11 +40,230 @@ from core.config import (
     DOCKER_SANDBOX_ENABLED,
     DOCKER_SANDBOX_IMAGE,
     EXECUTION_TIMEOUT_SECONDS,
+    SANDBOX_CPU_TIME_LIMIT_SECONDS,
+    SANDBOX_MEMORY_LIMIT_BYTES,
 )
 
 logger = logging.getLogger("uvicorn.info")
 
 _ANON_SESSION = "__anon__"
+
+
+# ---------------------------------------------------------------------------
+# Custom exception for sandbox constraint violations  (BUG 1 fix)
+# ---------------------------------------------------------------------------
+
+class SandboxViolationError(RuntimeError):
+    """Raised when a sandboxed script breaches a resource or path constraint.
+
+    Keeping violations as a typed exception allows the orchestrator to handle
+    them differently from ordinary execution errors (e.g. not retrying on RCE).
+    """
+
+
+# ---------------------------------------------------------------------------
+# Resource-limit preexec helper  (BUG 1 fix — Unix only)
+# ---------------------------------------------------------------------------
+
+def _apply_resource_limits() -> None:  # pragma: no cover
+    """Called by the child process before exec() to install resource caps.
+
+    This function runs *inside the forked child* on Unix systems.  It sets:
+      - RLIMIT_CPU: max CPU time in seconds (soft=limit, hard=limit+5)
+      - RLIMIT_AS:  max virtual address space (soft=limit, hard=limit)
+
+    On Windows ``resource`` is not available; we log a warning and continue
+    so that the rest of the sandbox machinery (timeout kill, env sanitisation)
+    still works.
+    """
+    try:
+        import resource  # pylint: disable=import-outside-toplevel
+        cpu_soft = SANDBOX_CPU_TIME_LIMIT_SECONDS
+        cpu_hard = cpu_soft + 5  # kernel sends SIGXCPU at soft, SIGKILL at hard
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_soft, cpu_hard))
+
+        mem = SANDBOX_MEMORY_LIMIT_BYTES
+        resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+    except ImportError:
+        # Windows — resource limits via preexec_fn are not supported
+        pass
+    except Exception as exc:  # pylint: disable=broad-except
+        # Swallow here — we are inside the child; a raised exception would
+        # cause confusing spawn errors instead of a clean timeout kill.
+        import sys as _sys  # pylint: disable=import-outside-toplevel
+        print(f"[Sandbox] WARNING: resource limits not applied: {exc}", file=_sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Output size cap (P1 OOM fix)
+# ---------------------------------------------------------------------------
+
+# Hard limit on captured stdout + stderr per execution.  A script that prints
+# in an infinite loop (e.g. `while True: print("A" * 1024)`) would otherwise
+# exhaust the host OS memory before the timeout fires, crashing the FastAPI
+# thread pool.  2 MB per stream is generous for legitimate analytics output.
+_MAX_OUTPUT_BYTES: int = 2 * 1024 * 1024  # 2 MB
+_OUTPUT_TRUNCATED_SENTINEL = (
+    "\n\n[TRUNCATED] Output exceeded 2 MB limit and was cut off."
+)
+
+
+def _read_capped(stream, max_bytes: int = _MAX_OUTPUT_BYTES) -> str:
+    """Reads up to *max_bytes* from a binary stream and decodes to str.
+
+    Designed to be called from a background thread concurrently with the other
+    stream so neither pipe blocks the process (pipe-deadlock prevention).  Any
+    data beyond the cap is silently drained so the child doesn't stall on a
+    full pipe buffer.  A sentinel string is appended when truncation occurs so
+    the LLM knows the output ended early rather than cleanly.
+
+    Args:
+        stream: A readable binary file-like object (subprocess PIPE).
+        max_bytes: Maximum bytes to read before truncating.
+
+    Returns:
+        Decoded string, with a truncation notice when the cap was reached.
+    """
+    chunks: list = []
+    total = 0
+    truncated = False
+    try:
+        while True:
+            chunk = stream.read(65536)  # 64 KB reads
+            if not chunk:
+                break
+            remaining = max_bytes - total
+            if remaining <= 0:
+                truncated = True
+                # Keep draining so the child doesn't block on a full pipe
+                continue
+            if len(chunk) > remaining:
+                chunks.append(chunk[:remaining])
+                total += remaining
+                truncated = True
+            else:
+                chunks.append(chunk)
+                total += len(chunk)
+    except Exception:  # pylint: disable=broad-except
+        pass
+    text = b"".join(chunks).decode("utf-8", errors="replace")
+    if truncated:
+        text += _OUTPUT_TRUNCATED_SENTINEL
+        logger.warning(
+            "[Executor] Output truncated at %d bytes — possible infinite print loop.",
+            max_bytes,
+        )
+    return text
+
+
+def _run_popen_capped(
+    args: list,
+    cwd: str,
+    env: dict,
+    timeout: int,
+    allowed_cwd: str = "",
+) -> "tuple[str, str, int]":
+    """Runs a subprocess with concurrent capped pipe readers (deadlock-safe).
+
+    BUG 1 (HIGH) fix — additional hardening over the original:
+      * ``start_new_session=True`` puts the child in its own process group so
+        that ``os.killpg`` can reliably kill the *entire* process tree on
+        timeout, not just the top-level PID.
+      * ``preexec_fn=_apply_resource_limits`` installs RLIMIT_CPU / RLIMIT_AS
+        inside the forked child before exec (Unix only).
+      * Path whitelist check: if ``allowed_cwd`` is provided, any attempt by
+        the args list to reference a path outside it raises
+        ``SandboxViolationError`` before the process is even spawned.
+      * Timeout kill uses ``os.killpg`` (SIGKILL to the whole group) then
+        ``proc.wait()`` to reap zombies; raw exceptions are wrapped in
+        ``SandboxViolationError`` to prevent leaking OS internals to callers.
+
+    Args:
+        args: Command + arguments list for subprocess.
+        cwd: Working directory for the subprocess.
+        env: Environment variables dict.
+        timeout: Wall-clock timeout in seconds.
+        allowed_cwd: Optional absolute path prefix; any arg that is an
+            absolute path outside this prefix raises SandboxViolationError.
+
+    Returns:
+        Tuple of (stdout_text, stderr_text, returncode).
+
+    Raises:
+        SandboxViolationError: On timeout, resource breach, or path violation.
+    """
+    # ── Path whitelist check (before spawn) ──────────────────────────────────
+    if allowed_cwd:
+        _allowed = os.path.realpath(allowed_cwd)
+        for i, arg in enumerate(args):
+            # Exempt the executable itself (args[0]) from the sandbox constraint
+            if i == 0:
+                continue
+            if isinstance(arg, str) and os.path.isabs(arg):
+                if not os.path.realpath(arg).startswith(_allowed):
+                    raise SandboxViolationError(
+                        f"Path constraint violated: '{arg}' is outside sandbox '{_allowed}'. "
+                        "Execution aborted."
+                    )
+
+    # ── Spawn child in its own session (process group) ───────────────────────
+    popen_kwargs: Dict[str, Any] = dict(
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+    )
+    _is_unix = hasattr(os, "killpg")
+    if _is_unix:
+        # start_new_session=True creates a new process group leader so we
+        # can send SIGKILL to every child spawned by the script.
+        popen_kwargs["start_new_session"] = True
+        popen_kwargs["preexec_fn"] = _apply_resource_limits
+
+    try:
+        proc = subprocess.Popen(args, **popen_kwargs)
+    except OSError as exc:
+        raise SandboxViolationError(
+            f"Failed to spawn sandbox subprocess: {exc}"
+        ) from exc
+
+    stdout_holder: list = [""]
+    stderr_holder: list = [""]
+
+    t_out = threading.Thread(
+        target=lambda: stdout_holder.__setitem__(0, _read_capped(proc.stdout)),
+        daemon=True,
+    )
+    t_err = threading.Thread(
+        target=lambda: stderr_holder.__setitem__(0, _read_capped(proc.stderr)),
+        daemon=True,
+    )
+    t_out.start()
+    t_err.start()
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Kill entire process group (Unix) or just the process (Windows)
+        if _is_unix:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # Process already exited — nothing to kill
+        else:
+            proc.kill()
+        proc.wait()  # reap zombie
+        t_out.join(timeout=5)
+        t_err.join(timeout=5)
+        raise SandboxViolationError(
+            f"Execution timed out after {timeout} seconds. "
+            "The process tree was killed."
+        )
+
+    t_out.join()
+    t_err.join()
+    return stdout_holder[0], stderr_holder[0], proc.returncode
+
 
 # ---------------------------------------------------------------------------
 # Minimal allowed environment variables (credential-safe)
@@ -71,6 +299,7 @@ _MIME_BY_EXT: Dict[str, str] = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".svg": "image/svg+xml",
+    ".html": "text/html",
     ".pdf": "application/pdf",
     ".csv": "text/csv",
     ".txt": "text/plain",
@@ -156,6 +385,7 @@ class CodeExecutor:
         self,
         code: str,
         session_id: str = _ANON_SESSION,
+        workspace_id: Optional[str] = None,
     ) -> ExecutionResult:
         """Writes code to a temp file and executes it asynchronously.
 
@@ -163,6 +393,9 @@ class CodeExecutor:
             code: Python source code to execute.
             session_id: Session identifier used to fetch only that session's
                 uploaded files into the sandbox (Gap 1 isolation fix).
+            workspace_id: Optional workspace UUID. When the in-memory session
+                cache is empty, files are loaded from the workspace disk
+                directory as a fallback (fixes file-disappearance bug).
 
         Returns:
             ExecutionResult with captured outputs and any artifacts.
@@ -170,11 +403,11 @@ class CodeExecutor:
         loop = asyncio.get_running_loop()
         if DOCKER_SANDBOX_ENABLED:
             result = await loop.run_in_executor(
-                None, self._run_in_docker, code, session_id
+                None, self._run_in_docker, code, session_id, workspace_id
             )
         else:
             result = await loop.run_in_executor(
-                None, self._run_sync, code, session_id
+                None, self._run_sync, code, session_id, workspace_id
             )
         return result
 
@@ -184,12 +417,15 @@ class CodeExecutor:
         self,
         code: str,
         session_id: str = _ANON_SESSION,
+        workspace_id: Optional[str] = None,
     ) -> ExecutionResult:
         """Synchronous subprocess execution — runs in a thread pool worker.
 
         Args:
             code: Python source code to execute.
             session_id: Session whose uploaded files to inject into the sandbox.
+            workspace_id: Optional workspace UUID used as a disk-file fallback
+                when the in-memory session cache is empty.
 
         Returns:
             ExecutionResult with captured outputs.
@@ -203,7 +439,37 @@ class CodeExecutor:
 
             # Write only THIS session's files into the sandbox tmpdir.
             # get_session_files() returns a snapshot copy — safe to iterate.
-            for filename, content in get_session_files(session_id).items():
+            session_files = get_session_files(session_id)
+
+            # Workspace disk-file fallback: if the in-memory cache is empty
+            # (e.g. server restart, or workspace-upload path keyed differently)
+            # copy files from the workspace directory on disk.
+            if not session_files and workspace_id:
+                workspace_dir = os.path.join(
+                    os.environ.get("WORKSPACE_FILES_DIR", "/workspace"),
+                    workspace_id,
+                )
+                if os.path.isdir(workspace_dir):
+                    for fname in os.listdir(workspace_dir):
+                        fpath = os.path.join(workspace_dir, fname)
+                        if os.path.isfile(fpath):
+                            try:
+                                with open(fpath, "rb") as fh:
+                                    session_files[fname] = fh.read()
+                            except Exception as exc:  # pylint: disable=broad-except
+                                logger.warning(
+                                    "[Executor] Could not read workspace file %s: %s",
+                                    fname, exc,
+                                )
+                    if session_files:
+                        logger.info(
+                            "[Executor] Loaded %d file(s) from workspace disk fallback "
+                            "(workspace_id=%s).",
+                            len(session_files),
+                            workspace_id,
+                        )
+
+            for filename, content in session_files.items():
                 file_path = os.path.join(tmpdir, filename)
                 try:
                     with open(file_path, "wb") as fh:
@@ -242,28 +508,29 @@ class CodeExecutor:
             )
 
             try:
-                proc = subprocess.run(
-                    [sys.executable, script_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=EXECUTION_TIMEOUT_SECONDS,
+                # BUG 1 fix: pass allowed_cwd=tmpdir so any absolute path
+                # outside the temp sandbox is caught before process spawn.
+                # _run_popen_capped now uses start_new_session + killpg for
+                # reliable process-tree teardown, and raises SandboxViolationError
+                # on timeout/constraint breach instead of raw exceptions.
+                stdout_text, stderr_text, returncode = _run_popen_capped(
+                    args=[sys.executable, script_path],
                     cwd=tmpdir,
-                    env=_safe_env(),   # SANITISED environment — no credentials
+                    env=_safe_env(),
+                    timeout=EXECUTION_TIMEOUT_SECONDS,
+                    allowed_cwd=tmpdir,
                 )
                 result = ExecutionResult(
-                    stdout=proc.stdout,
-                    stderr=proc.stderr,
-                    returncode=proc.returncode,
+                    stdout=stdout_text,
+                    stderr=stderr_text,
+                    returncode=returncode,
                 )
-            except subprocess.TimeoutExpired:
-                logger.warning(
-                    "[Executor] Script timed out after %ds.", EXECUTION_TIMEOUT_SECONDS
-                )
+            except SandboxViolationError as exc:
+                # Surface sandbox breaches clearly — do NOT retry these
+                logger.error("[Executor] Sandbox violation: %s", exc)
                 result = ExecutionResult(
                     stdout="",
-                    stderr=(
-                        f"Execution timed out after {EXECUTION_TIMEOUT_SECONDS} seconds."
-                    ),
+                    stderr=f"Sandbox violation: {exc}",
                     returncode=1,
                 )
             except Exception as exc:  # pylint: disable=broad-except
@@ -292,6 +559,7 @@ class CodeExecutor:
         self,
         code: str,
         session_id: str = _ANON_SESSION,
+        workspace_id: Optional[str] = None,
     ) -> ExecutionResult:
         """Executes code inside a Docker container with network/resource limits.
 
@@ -307,6 +575,8 @@ class CodeExecutor:
         Args:
             code: Python source code to execute.
             session_id: Session whose uploaded files to inject into the sandbox.
+            workspace_id: Optional workspace UUID; used as disk-file fallback
+                when the in-memory session cache is empty.
 
         Returns:
             ExecutionResult with captured outputs and any artifacts.
@@ -334,7 +604,28 @@ class CodeExecutor:
             os.makedirs(outputs_dir, exist_ok=True)
 
             # Write session files to tmpdir so Docker can mount them
-            for filename, content in get_session_files(session_id).items():
+            session_files = get_session_files(session_id)
+
+            # Workspace disk-file fallback (mirrors _run_sync logic)
+            if not session_files and workspace_id:
+                workspace_dir = os.path.join(
+                    os.environ.get("WORKSPACE_FILES_DIR", "/workspace"),
+                    workspace_id,
+                )
+                if os.path.isdir(workspace_dir):
+                    for fname in os.listdir(workspace_dir):
+                        fpath = os.path.join(workspace_dir, fname)
+                        if os.path.isfile(fpath):
+                            try:
+                                with open(fpath, "rb") as fh:
+                                    session_files[fname] = fh.read()
+                            except Exception as exc:  # pylint: disable=broad-except
+                                logger.warning(
+                                    "[Executor] Could not read workspace file %s: %s",
+                                    fname, exc,
+                                )
+
+            for filename, content in session_files.items():
                 with open(os.path.join(tmpdir, filename), "wb") as fh:
                     fh.write(content)
 

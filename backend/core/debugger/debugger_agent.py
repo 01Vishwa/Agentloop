@@ -86,10 +86,16 @@ RULES — read carefully:
    - Missing import → add it at the top of the script.
    - KeyError on column → use df.get(col) or check df.columns first.
    - Division by zero / NaN result → add a zero-variance guard.
-4. After fixing, return the ENTIRE corrected script (not just the diff).
-5. Output ONLY raw Python. No markdown fences (``` or `python`).
-6. Classify the error_type from the traceback accurately.
-7. Write a concise fix_summary (one sentence maximum).
+4. MULTI-FILE MERGE ERRORS — when a MergeError, KeyError on a join key, or
+   empty-merge result is detected AND a MULTI-FILE CONTEXT block is provided:
+   - Switch to explicit left_on/right_on parameters if 'on=' was used.
+   - Verify that the join columns exist in both DataFrames before merging.
+   - If the merge produces 0 rows, try switching how='left' and log a warning.
+   - Check for casing mismatches (e.g. 'ID' vs 'id') using str.lower().
+5. After fixing, return the ENTIRE corrected script (not just the diff).
+6. Output ONLY raw Python. No markdown fences (``` or `python`).
+7. Classify the error_type from the traceback accurately.
+8. Write a concise fix_summary (one sentence maximum).
 """
 
 _DEBUGGER_HUMAN = """\
@@ -167,6 +173,7 @@ class DebuggerAgent:
         plan_steps: List[Dict[str, Any]],
         schema_context: str = "",
         token_tracker: Optional[TokenTracker] = None,
+        multi_file_context=None,  # Optional[MultiFileContext]
     ) -> Dict[str, Any]:
         """Repairs the failing script and returns the corrected version.
 
@@ -176,9 +183,10 @@ class DebuggerAgent:
             plan_steps: Current plan steps, for context.
             schema_context: Data schema summary (column names / types) to help
                 the debugger understand data-specific errors.
-            token_tracker: Optional run-level tracker.  When provided, token
-                usage from this LLM call is recorded automatically via a
-                LangChain callback.
+            token_tracker: Optional run-level tracker.
+            multi_file_context: Optional MultiFileContext. When provided and
+                a merge-related error is detected, join context is appended
+                to schema_context so the debugger can fix join key issues.
 
         Returns:
             Dict with keys:
@@ -195,6 +203,28 @@ class DebuggerAgent:
         trimmed_tb = traceback[-_MAX_TRACEBACK_CHARS:]
         trimmed_code = code[-_MAX_CODE_CHARS:]
 
+        # Detect merge-related errors and append join context when available
+        _MERGE_ERROR_KEYWORDS = (
+            "mergeerror", "merge error", "keyerror",
+            "mergekey", "left_on", "right_on", "pd.merge",
+        )
+        _tb_lower = (traceback or "").lower()
+        _is_merge_error = any(kw in _tb_lower for kw in _MERGE_ERROR_KEYWORDS) or (
+            ("valueerror" in _tb_lower or "key" in _tb_lower)
+            and any(kw in _tb_lower for kw in ("merge", "join", "column"))
+        )
+        effective_schema_context = schema_context
+        if _is_merge_error and multi_file_context is not None and multi_file_context.files:
+            join_block = (
+                "\n\nMULTI-FILE CONTEXT (use this to fix join key errors):\n"
+                + multi_file_context.to_prompt_str()
+                + "\n\nIMPORTANT: Use explicit left_on/right_on, never 'on=' when column "
+                "names differ. Check for case mismatches (e.g. 'ID' vs 'id')."
+            )
+            effective_schema_context = (schema_context or "") + join_block
+            logger.info(
+                "[Debugger] Merge error detected — injected MultiFileContext into schema_context."
+            )
         if self._chain is None:
             built = self._build_chain()      # heavy work — no lock held
             async with self._lock:
@@ -208,7 +238,7 @@ class DebuggerAgent:
             chain.ainvoke(
                 {
                     "traceback": trimmed_tb or "(no traceback — check stderr)",
-                    "schema_context": schema_context or "(no schema context available)",
+                    "schema_context": effective_schema_context or "(no schema context available)",
                     "code": trimmed_code,
                     "plan_steps": formatted_steps,
                 },

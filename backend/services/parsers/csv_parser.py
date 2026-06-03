@@ -13,6 +13,7 @@ import io
 import pandas as pd
 
 from core.validation import sanitize_text
+from services.parsers import sanitize_records
 
 
 def parse_csv(file_name: str, file_content: bytes) -> Dict[str, Any]:
@@ -38,6 +39,10 @@ def parse_csv(file_name: str, file_content: bytes) -> Dict[str, Any]:
         # Serialize dtypes as a readable dict (str keys, str values)
         dtypes_map = {col: str(dtype) for col, dtype in df.dtypes.items()}
 
+        # sanitize_records replaces NaN/Inf with None so the result is
+        # JSON-serializable (required for Supabase schema_json column).
+        safe_sample = sanitize_records(df, n=5)
+
         return {
             "file_name": file_name,
             "source_type": "csv",
@@ -48,10 +53,11 @@ def parse_csv(file_name: str, file_content: bytes) -> Dict[str, Any]:
                 "dtypes": dtypes_map,
                 "shape": list(df.shape),           # [rows, cols]
                 "row_count": len(df),
-                "sample_rows": df.head(5).to_dict(orient="records"),
+                "sample_rows": safe_sample,
                 # Legacy key kept for any downstream consumers
-                "sample_data": df.head(5).to_dict(orient="records"),
+                "sample_data": safe_sample,
             },
         }
     except Exception as exc:
         raise ValueError(f"Failed to parse CSV: {exc}") from exc
+

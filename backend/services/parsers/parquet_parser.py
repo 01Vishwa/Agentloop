@@ -10,6 +10,7 @@ from typing import Any, Dict
 import io
 
 from core.validation import sanitize_text
+from services.parsers import sanitize_records
 
 
 def parse_parquet(file_name: str, file_content: bytes) -> Dict[str, Any]:
@@ -44,7 +45,7 @@ def parse_parquet(file_name: str, file_content: bytes) -> Dict[str, Any]:
                 "dtypes": dtypes_map,
                 "shape": list(df.shape),
                 "row_count": len(df),
-                "sample_rows": df.head(5).to_dict(orient="records"),
+                "sample_rows": sanitize_records(df, n=5),
             },
         }
     except ImportError as exc:

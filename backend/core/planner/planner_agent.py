@@ -37,6 +37,13 @@ class PlanStep(BaseModel):
         default="pending",
         description="Execution status: pending | done | failed.",
     )
+    step_type: str = Field(
+        default="general",
+        description=(
+            "Step category — one of: load | filter | aggregate | visualise | "
+            "merge | clarify | general."
+        ),
+    )
 
 
 class PlanOutput(BaseModel):
@@ -66,11 +73,17 @@ _INITIAL_PLAN_SYSTEM = (
     "  Visualization (plot/chart), or Insight (answer a question).\n"
     "- Tailor steps to the task type: e.g., include train/test split for ML, "
     "  plt.savefig for Visualization, print() for Insight.\n"
+    "- Valid step_type values: load | filter | aggregate | visualise | "
+    "  merge | clarify | general.\n"
+    "- Set step_type to 'merge' for any pd.merge() operation.\n"
+    "- Set step_type to 'clarify' ONLY when the join columns are ambiguous "
+    "  (confidence < 0.5 for ALL candidates); do not proceed to coding in that case.\n"
 )
 
 _INITIAL_PLAN_HUMAN = (
     "USER QUERY:\n{query}\n\n"
     "DATA DESCRIPTION:\n{data_description}"
+    "{join_hints_block}"
 )
 
 # ---------------------------------------------------------------------------
@@ -151,6 +164,7 @@ class PlannerAgent:
         token_tracker: Optional[TokenTracker] = None,
         execution_output: str = "",
         completed_steps: Optional[List[Dict[str, Any]]] = None,
+        join_hints: str = "",
     ) -> List[Dict[str, Any]]:
         """Generates or extends the analysis plan.
 
@@ -202,14 +216,17 @@ class PlannerAgent:
                 f"  Step {s['index'] + 1}: {s['description']} [{s.get('status', 'done')}]"
                 for s in (completed_steps or [])
             ) or "(none yet)"
-            result: PlanOutput = await next_step_chain.ainvoke(
-                {
-                    "query": query,
-                    "data_description": data_description,
-                    "completed_steps": completed_str,
-                    "execution_output": execution_output[:2000],
-                },
-                config=tracker_callback_config(token_tracker),
+            result: PlanOutput = await asyncio.wait_for(
+                next_step_chain.ainvoke(
+                    {
+                        "query": query,
+                        "data_description": data_description,
+                        "completed_steps": completed_str,
+                        "execution_output": execution_output[:2000],
+                    },
+                    config=tracker_callback_config(token_tracker),
+                ),
+                timeout=30.0,
             )
             # Sequential mode should return 1 step; use the first if more
             steps = [result.steps[0].model_dump()] if result.steps else []
@@ -225,12 +242,34 @@ class PlannerAgent:
                     if self._chain is None:      # double-checked locking
                         self._chain = built
             chain = self._chain
-            result = await chain.ainvoke(
-                {
-                    "query": query,
-                    "data_description": data_description,
-                },
-                config=tracker_callback_config(token_tracker),
+            # Build optional join hints block for multi-file workspaces
+            if join_hints and join_hints.strip():
+                join_hints_block = (
+                    "\n\nDETECTED JOIN KEYS:\n"
+                    + join_hints
+                    + "\n\nPLANNING RULES FOR MULTI-FILE WORKSPACES:\n"
+                    "- When the user's query requires data from more than one file, "
+                    "include a step of type 'merge' before any aggregation or filtering.\n"
+                    "- A 'merge' step must specify in its description: "
+                    "left_df, right_df, left_on, right_on, how (inner/left/right/outer).\n"
+                    "- Prefer the highest-confidence join candidate unless the query "
+                    "implies a specific column.\n"
+                    "- If no confident candidate exists (all < 0.5), add a 'clarify' "
+                    "step asking the user which columns to join on, and do NOT "
+                    "proceed to coding."
+                )
+            else:
+                join_hints_block = ""
+            result = await asyncio.wait_for(
+                chain.ainvoke(
+                    {
+                        "query": query,
+                        "data_description": data_description,
+                        "join_hints_block": join_hints_block,
+                    },
+                    config=tracker_callback_config(token_tracker),
+                ),
+                timeout=30.0,
             )
             steps = [s.model_dump() for s in result.steps]
 

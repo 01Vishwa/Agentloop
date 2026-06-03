@@ -17,6 +17,11 @@ Fixes applied:
   lightweight background monitor task (polling every 1 s) rather than
   awaiting http_request.is_disconnected() on every single SSE event.
 - ARCH-03: All Supabase helper functions are now awaited (async callers).
+- WS-01: Workspace auto-hydration: when context is empty and workspace_id is
+  present, files are loaded from disk into the session cache so the orchestrator
+  always has data — fixing the root cause of the "files disappear" bug where
+  workspace files shown in the UI (fetched from Supabase) were never put through
+  /process and were therefore invisible to the backend session cache.
 """
 
 import asyncio
@@ -26,8 +31,6 @@ import uuid
 from typing import Any, AsyncGenerator, Dict, Optional, Tuple
 
 from fastapi import Request
-
-from eval.eval_logger import EvalLogger
 
 from core.config import MAX_AGENT_ROUNDS
 from core.ds_star_orchestrator import DsStarOrchestrator
@@ -46,7 +49,6 @@ _orchestrator_cache: Dict[_OrchestratorKey, DsStarOrchestrator] = {}
 
 
 def _get_orchestrator(
-    max_rounds: Optional[int],
     model: Optional[str],
     coder_model: Optional[str],
     temperature: Optional[float],
@@ -55,14 +57,14 @@ def _get_orchestrator(
 
     Orchestrators are keyed by (model, coder_model, temperature) since those
     determine which ChatNVIDIA instances are built inside. ``max_rounds`` is
-    not part of the key because it is per-request configurable and is applied
-    to the orchestrator's ``_max_rounds`` attribute directly.
+    NOT part of the key and NOT mutated on the cached instance — it is
+    resolved at call-time and forwarded into ``orchestrator.run()`` directly
+    (P1-01 fix: eliminates the shared-instance data race).
 
     DsStarOrchestrator.run() stores all per-run state in local variables, so
     sharing instances across requests is safe.
 
     Args:
-        max_rounds: Per-request round limit.
         model: Reasoning LLM model override.
         coder_model: Code-generation LLM model override.
         temperature: Sampling temperature override.
@@ -73,7 +75,6 @@ def _get_orchestrator(
     cache_key: _OrchestratorKey = (model, coder_model, temperature)
     if cache_key not in _orchestrator_cache:
         _orchestrator_cache[cache_key] = DsStarOrchestrator(
-            max_rounds=max_rounds,
             model=model,
             coder_model=coder_model,
             temperature=temperature,
@@ -82,10 +83,92 @@ def _get_orchestrator(
             "[AgentController] Orchestrator created — model=%s, coder=%s, temp=%s",
             model, coder_model, temperature,
         )
-    orchestrator = _orchestrator_cache[cache_key]
-    # Apply per-request max_rounds without invalidating the cache
-    orchestrator._max_rounds = max_rounds or MAX_AGENT_ROUNDS
-    return orchestrator
+    return _orchestrator_cache[cache_key]
+
+
+# ---------------------------------------------------------------------------
+# WS-01: Workspace auto-hydration helper
+# ---------------------------------------------------------------------------
+
+async def _hydrate_context_from_workspace(
+    workspace_id: str,
+    session_id: str,
+) -> Dict[str, Any]:
+    """Loads workspace files from disk into the session cache and returns context.
+
+    Called when ``handle_agent_run`` receives an empty context but a
+    ``workspace_id`` is set.  This happens when the frontend loads files from
+    Supabase (workspace view) and starts a run without going through ``/process``
+    — the in-memory session cache is empty even though files exist on disk.
+
+    Strategy:
+    1. Scan ``/workspace/{workspace_id}/`` for data files.
+    2. Read each file's bytes into the session cache (``_FILE_CACHE``).
+    3. Run the synchronous ``process_documents`` to extract schema context.
+    4. Return the resulting ``combined_extractions`` dict.
+
+    Args:
+        workspace_id: UUID of the workspace whose files to load.
+        session_id: Session bucket to populate in the file cache.
+
+    Returns:
+        A context dict compatible with what ``/process`` would return,
+        or an empty dict if no files are found.
+    """
+    import os  # pylint: disable=import-outside-toplevel
+    from services.upload_service import _FILE_CACHE, _CACHE_LOCK  # pylint: disable=import-outside-toplevel
+    from services.process_service import process_documents  # pylint: disable=import-outside-toplevel
+
+    workspace_base = os.environ.get("WORKSPACE_FILES_DIR", "/workspace")
+    workspace_dir = os.path.join(workspace_base, workspace_id)
+
+    if not os.path.isdir(workspace_dir):
+        logger.warning(
+            "[AgentController] Workspace dir not found: %s — cannot auto-hydrate.",
+            workspace_dir,
+        )
+        return {}
+
+    # Gather all files from the workspace directory
+    loaded_names = []
+    for filename in os.listdir(workspace_dir):
+        file_path = os.path.join(workspace_dir, filename)
+        if not os.path.isfile(file_path):
+            continue
+        try:
+            with open(file_path, "rb") as fh:
+                content = fh.read()
+            with _CACHE_LOCK:
+                _FILE_CACHE.setdefault(session_id, {})[filename] = content
+            loaded_names.append(filename)
+            logger.info(
+                "[AgentController] WS-01: hydrated %s (%d bytes) → session=%s",
+                filename, len(content), session_id[:8],
+            )
+        except OSError as exc:
+            logger.warning(
+                "[AgentController] WS-01: could not read %s: %s", file_path, exc
+            )
+
+    if not loaded_names:
+        return {}
+
+    # Build processing context synchronously (CSV/PDF parsing is blocking)
+    loop = asyncio.get_running_loop()
+    try:
+        context = await loop.run_in_executor(
+            None, process_documents, loaded_names, session_id
+        )
+        logger.info(
+            "[AgentController] WS-01: auto-hydrated %d file(s) from workspace %s.",
+            len(loaded_names), workspace_id[:8],
+        )
+        return context
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning(
+            "[AgentController] WS-01: process_documents failed during hydration: %s", exc
+        )
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -153,18 +236,55 @@ async def handle_agent_run(
     """
     run_id = uuid.uuid4().hex
     _session_id = session_id or "__anon__"
+    _max_rounds = max_rounds or MAX_AGENT_ROUNDS
+
+    # WS-01: Auto-hydrate context from workspace disk when the session cache is
+    # empty.  This happens when the frontend loads workspace files from Supabase
+    # and starts a run without going through /process (files are shown in the UI
+    # but never put in the server-side session cache).
+    _combined = context.get("combined_extractions", {})
+    if not _combined and workspace_id:
+        logger.info(
+            "[AgentController] WS-01: context is empty but workspace_id=%s — hydrating.",
+            workspace_id[:8],
+        )
+        hydrated = await _hydrate_context_from_workspace(workspace_id, _session_id)
+        if hydrated:
+            context = {
+                **context,
+                "combined_extractions": hydrated.get("combined_extractions", {}),
+                "files_processed": hydrated.get("files_processed", 0),
+            }
+            logger.info(
+                "[AgentController] WS-01: context hydrated with %d file(s).",
+                context.get("files_processed", 0),
+            )
 
     # ARCH-01: use cached orchestrator instead of creating a new one per request
-    orchestrator = _get_orchestrator(max_rounds, model, coder_model, temperature)
+    # P1-01: max_rounds is resolved here and passed into run(), NOT mutated on
+    # the shared cached instance, eliminating the concurrent-request data race.
+    orchestrator = _get_orchestrator(model, coder_model, temperature)
 
     # Persist new run row — non-blocking
     await _try_create_run(run_id, _session_id, query, context, workspace_id, user_id)
 
-    # Eval sidecar — passive observer, zero orchestration changes
-    eval_logger = EvalLogger(run_id=run_id, query=query)
-
     # Emit run_id to the frontend immediately
     yield f"data: {json.dumps({'event': 'run_started', 'payload': {'run_id': run_id}})}\n\n"
+
+    # BUG 4 fix: Emit any parse_warnings accumulated during /process as SSE
+    # warning events *before* the orchestrator loop starts.  This gives the
+    # user visibility into near-empty files (blank PDFs, image-only scans)
+    # at the earliest possible moment — before any LLM call is made.
+    for pw in context.get("parse_warnings", []):
+        warn_payload = json.dumps({
+            "event": "warning",
+            "payload": {
+                "message": pw.get("message", "A file produced minimal extractable content."),
+                "filename": pw.get("filename", ""),
+                "source": "parse_warning",
+            },
+        })
+        yield f"data: {warn_payload}\n\n"
 
     # PERF-03: Set up disconnect monitoring via asyncio.Event
     disc_event = asyncio.Event()
@@ -180,6 +300,8 @@ async def handle_agent_run(
             context,
             run_id=run_id,
             session_id=_session_id,
+            max_rounds=_max_rounds,
+            workspace_id=workspace_id,
         ):
             # PERF-03: O(1) check — no await, no syscall per event
             if disc_event.is_set():
@@ -188,8 +310,6 @@ async def handle_agent_run(
                 )
                 await _try_update_run(run_id, {}, status="failed")
                 return
-
-            eval_logger.ingest(event)  # ← eval sidecar: passive observation
 
             payload = json.dumps(event, default=str)
             yield f"data: {payload}\n\n"
@@ -201,8 +321,16 @@ async def handle_agent_run(
                 await _try_update_run(run_id, event_payload, status="completed")
             elif event_type == "error":
                 await _try_update_run(run_id, event_payload, status="failed")
-            elif event_type == "metrics":
-                await _try_persist_metrics(run_id, event_payload)
+
+    except asyncio.CancelledError:
+        # P2-01 fix: CancelledError inherits from BaseException, not Exception.
+        # FastAPI cancels the streaming task on client disconnect — we must
+        # catch it explicitly to mark the run as failed before re-raising.
+        logger.info(
+            "[AgentController] Stream cancelled (client disconnect?) — run_id=%s", run_id
+        )
+        await _try_update_run(run_id, {}, status="failed")
+        raise  # re-raise so FastAPI can clean up the response properly
 
     except Exception as exc:  # pylint: disable=broad-except
         error_event = json.dumps({
@@ -216,7 +344,6 @@ async def handle_agent_run(
     finally:
         if monitor_task is not None:
             monitor_task.cancel()
-        await eval_logger.finalize()  # ← eval sidecar: flush to Supabase
         # File cache is retained across runs — users can run multiple queries on the
         # same uploaded data without re-uploading. Cleanup is handled by:
         #   • Explicit DELETE /api/clear (user action via handleClearAll)
@@ -286,28 +413,3 @@ async def _try_update_run(
         )
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning("[AgentController] Could not persist run result: %s", exc)
-
-
-async def _try_persist_metrics(run_id: str, metrics_payload: Dict[str, Any]) -> None:
-    """Attempts to persist run evaluation metrics to Supabase.
-
-    Args:
-        run_id: Unique run identifier.
-        metrics_payload: The ``payload`` dict from the ``metrics`` SSE event.
-    """
-    try:
-        from services.supabase_service import update_agent_run_metrics  # pylint: disable=import-outside-toplevel
-        await update_agent_run_metrics(
-            run_id=run_id,
-            metrics=metrics_payload.get("metrics", {}),
-            total_run_ms=metrics_payload.get("total_run_ms", 0),
-            complexity=metrics_payload.get("complexity", "easy"),
-        )
-        logger.info(
-            "[AgentController] Metrics persisted for run_id=%s, complexity=%s, total_ms=%d",
-            run_id,
-            metrics_payload.get("complexity", "easy"),
-            metrics_payload.get("total_run_ms", 0),
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.warning("[AgentController] Could not persist run metrics: %s", exc)

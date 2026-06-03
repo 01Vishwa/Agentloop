@@ -8,6 +8,7 @@
 
 import React, { useState } from 'react'
 import { Settings2, ChevronDown, ChevronUp, RotateCcw } from 'lucide-react'
+import { DEFAULT_SETTINGS } from './agentSettingsConstants'
 
 // ── Available model options ──────────────────────────────────────────────────
 const REASONING_MODELS = [
@@ -24,13 +25,6 @@ const CODER_MODELS = [
   { value: 'meta/llama-3.1-70b-instruct',           label: 'Llama 3.1 70B (general)' },
   { value: 'google/gemma-4-31b-it',                 label: 'Gemma 4 31B IT' },
 ]
-
-export const DEFAULT_SETTINGS = {
-  maxRounds:   10,
-  model:       'meta/llama-3.1-70b-instruct',
-  coderModel:  'meta/codellama-70b-instruct',
-  temperature: 0.1,
-}
 
 // ── Small labelled slider ────────────────────────────────────────────────────
 function Slider({ id, label, min, max, step, value, onChange, format, disabled = false }) {

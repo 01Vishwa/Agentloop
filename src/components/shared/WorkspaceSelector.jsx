@@ -65,7 +65,7 @@ export function WorkspaceSelector() {
     setOpen(false)
   }, [setActiveWorkspace])
 
-  const handleCreate = useCallback(async (e) => {
+  const handleCreate = async (e) => {
     e.preventDefault()
     if (!newName.trim() || !user?.id) return
     setCreateLoading(true)
@@ -74,7 +74,7 @@ export function WorkspaceSelector() {
     setCreating(false)
     setCreateLoading(false)
     setOpen(false)
-  }, [newName, user?.id, createWorkspace])
+  }
 
   // Don't render for anonymous users
   if (!isAuthenticated) return null

@@ -9,11 +9,10 @@ import { useAuth } from '../../contexts/AuthContext'
 import { toast } from '../shared/Toast'
 import { PlanStepList } from './PlanStepList'
 import { CodeBlock } from './CodeBlock'
-import { AgentMetricsOverlay } from './AgentMetricsOverlay'
 
 // Strip leading markdown/unicode bullet characters from a string so we don't
 // render a CSS dot AND an embedded '• ' or '* ' simultaneously.
-const cleanBullet = (s) => s.replace(/^[•\-\*]\s*/, '').trim()
+const cleanBullet = (s) => s.replace(/^[•\-*]\s*/, '').trim()
 
 // ─── Phase meta ─────────────────────────────────────────────────────────────
 const PHASE_META = {
@@ -351,11 +350,6 @@ export function AgentProgressPanel({
   activeRunId,
   onReset,
   onRerun,
-  // Metrics props (from 'metrics' SSE event)
-  runMetrics,
-  totalRunMs,
-  complexity,
-  showMetrics,
   // Deep Research mode props
   isResearchMode,
   subQuestions,
@@ -684,15 +678,6 @@ export function AgentProgressPanel({
           )}
         </div>
       )}
-
-      {/* ── Evaluation Metrics Overlay (when run completes) ──────────── */}
-      <AgentMetricsOverlay
-        metrics={runMetrics}
-        totalRunMs={totalRunMs}
-        complexity={complexity}
-        rounds={currentRound}
-        isVisible={showMetrics && agentStatus === 'completed'}
-      />
 
       {/* ── Idle empty state ─────────────────────────────────────────── */}
       {agentStatus === 'idle' && (

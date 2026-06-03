@@ -14,6 +14,7 @@ import io
 import pandas as pd
 
 from core.validation import sanitize_text
+from services.parsers import sanitize_records
 
 
 def parse_excel(file_name: str, file_content: bytes) -> Dict[str, Any]:
@@ -59,12 +60,12 @@ def parse_excel(file_name: str, file_content: bytes) -> Dict[str, Any]:
                 "dtypes": dtypes_map,
                 "shape": list(first_df.shape),        # [rows, cols]
                 "row_count": len(first_df),
-                "sample_rows": first_df.head(5).to_dict(orient="records"),
+                "sample_rows": sanitize_records(first_df, n=5),
                 # XLSX-specific extras
                 "sheet_count": len(sheets),
                 "sheet_names": sheets,
                 # Legacy key kept for any downstream consumers
-                "preview_first_sheet": first_df.head(5).to_dict(orient="records"),
+                "preview_first_sheet": sanitize_records(first_df, n=5),
             },
         }
     except Exception as exc:

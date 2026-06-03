@@ -5,6 +5,11 @@
  *  - The list of user workspaces fetched from Supabase.
  *  - The currently active workspace (persisted to sessionStorage).
  *  - CRUD actions: fetch, create, select.
+ *  - Multi-file context: the MultiFileContext returned by the backend
+ *    after a workspace upload, including FileSchema objects and inferred
+ *    join candidates.
+ *  - Join overrides: manually specified join key pairs that override the
+ *    inferred candidates in SchemaPreviewPanel.
  *
  * The store is auth-aware: fetchWorkspaces() is a no-op when no
  * access token is provided, and createWorkspace() guards the same way.
@@ -45,9 +50,34 @@ function persistWorkspaceId(id) {
 
 /**
  * @typedef {import('../types/index').Workspace} Workspace
+ *
+ * @typedef {Object} JoinCandidate
+ * @property {string} left_var
+ * @property {string} right_var
+ * @property {string} left_col
+ * @property {string} right_col
+ * @property {number} confidence
+ * @property {string} reason
+ *
+ * @typedef {Object} ColumnMeta
+ * @property {string} name
+ * @property {string} dtype
+ * @property {string[]} sample_values
+ *
+ * @typedef {Object} FileSchema
+ * @property {string} var_name
+ * @property {string} file_name
+ * @property {string} file_path
+ * @property {string} file_type
+ * @property {number} row_count
+ * @property {ColumnMeta[]} columns
+ *
+ * @typedef {Object} MultiFileContext
+ * @property {FileSchema[]} files
+ * @property {JoinCandidate[]} join_candidates
  */
 
-export const useWorkspaceStore = create((set, get) => ({
+export const useWorkspaceStore = create((set) => ({
   /** @type {Workspace[]} */
   workspaces: [],
 
@@ -58,6 +88,24 @@ export const useWorkspaceStore = create((set, get) => ({
 
   /** @type {string|null} */
   error: null,
+
+  // ── Multi-file state ───────────────────────────────────────────────────────
+
+  /**
+   * The MultiFileContext returned by the backend after a workspace upload.
+   * Contains per-file schemas and inferred join candidates.
+   *
+   * @type {MultiFileContext|null}
+   */
+  multiFileContext: null,
+
+  /**
+   * User-specified join key overrides. Each entry replaces (not merges with)
+   * the inferred candidate at the same position when sent to the agent.
+   *
+   * @type {JoinCandidate[]}
+   */
+  joinOverrides: [],
 
   // ── Actions ──────────────────────────────────────────────────────────────
 
@@ -124,12 +172,64 @@ export const useWorkspaceStore = create((set, get) => ({
 
   /**
    * Sets the active workspace and persists the choice to sessionStorage.
+   * Clears the multi-file context because the new workspace has its own files.
    *
    * @param {Workspace} workspace
    */
   setActiveWorkspace: (workspace) => {
     persistWorkspaceId(workspace?.id ?? null)
-    set({ activeWorkspace: workspace })
+    set({ activeWorkspace: workspace, multiFileContext: null, joinOverrides: [] })
+  },
+
+  /**
+   * Stores the MultiFileContext returned after a workspace file upload.
+   * Called by FileUploadPanel after each successful upload response.
+   *
+   * @param {MultiFileContext|null} ctx
+   */
+  setMultiFileContext: (ctx) => {
+    set({ multiFileContext: ctx })
+  },
+
+  /**
+   * Appends a manual join key override.
+   * The override must be a JoinCandidate-shaped object.
+   * Duplicates (same left_var+left_col+right_var+right_col) are replaced.
+   *
+   * @param {JoinCandidate} candidate
+   */
+  addJoinOverride: (candidate) => {
+    set((state) => {
+      const existing = state.joinOverrides.filter(
+        (o) =>
+          !(
+            o.left_var === candidate.left_var &&
+            o.left_col === candidate.left_col &&
+            o.right_var === candidate.right_var &&
+            o.right_col === candidate.right_col
+          )
+      )
+      return { joinOverrides: [...existing, { ...candidate, confidence: 1.0, reason: 'manual override' }] }
+    })
+  },
+
+  /**
+   * Removes the join override at the given index.
+   *
+   * @param {number} index
+   */
+  removeJoinOverride: (index) => {
+    set((state) => ({
+      joinOverrides: state.joinOverrides.filter((_, i) => i !== index),
+    }))
+  },
+
+  /**
+   * Clears the multi-file context and all overrides.
+   * Called when the user removes all files from the workspace.
+   */
+  resetFileContext: () => {
+    set({ multiFileContext: null, joinOverrides: [] })
   },
 
   /**
@@ -137,6 +237,13 @@ export const useWorkspaceStore = create((set, get) => ({
    */
   reset: () => {
     persistWorkspaceId(null)
-    set({ workspaces: [], activeWorkspace: null, loading: false, error: null })
+    set({
+      workspaces: [],
+      activeWorkspace: null,
+      loading: false,
+      error: null,
+      multiFileContext: null,
+      joinOverrides: [],
+    })
   },
 }))

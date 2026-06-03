@@ -45,9 +45,6 @@ ALLOWED_MIME_TYPES: Dict[str, str] = {
 # The previous restriction to csv/xlsx/json prevented hard-task benchmarks.
 ANALYSIS_MODE_ALLOWED_FORMATS: Set[str] = set(ALLOWED_MIME_TYPES.keys())
 
-# IDP mode accepts the same full set
-IDP_ALLOWED_FORMATS: Set[str] = set(ALLOWED_MIME_TYPES.keys())
-
 # ---------------------------------------------------------------------------
 # Supabase credentials
 # ---------------------------------------------------------------------------
@@ -128,6 +125,34 @@ DOCKER_SANDBOX_IMAGE: str = os.getenv(
 )
 DOCKER_MEMORY_LIMIT: str = os.getenv("DOCKER_MEMORY_LIMIT", "512m")
 DOCKER_CPU_QUOTA: float = float(os.getenv("DOCKER_CPU_QUOTA", "0.5"))
+
+# ---------------------------------------------------------------------------
+# Subprocess sandbox resource limits (BUG 1 fix)
+# ---------------------------------------------------------------------------
+# Applied via RLIMIT_CPU / RLIMIT_AS inside the forked child on Unix.
+# Keeps a runaway / malicious script from exhausting host CPU or RAM.
+
+# Max CPU seconds the sandbox script may consume before SIGXCPU / SIGKILL.
+SANDBOX_CPU_TIME_LIMIT_SECONDS: int = int(
+    os.getenv("SANDBOX_CPU_TIME_LIMIT_SECONDS", "30")
+)
+
+# Max virtual address space bytes (512 MB default) — prevents fork-bombs and
+# memory-hungry numpy/pandas operations from OOM-killing the host process.
+SANDBOX_MEMORY_LIMIT_BYTES: int = int(
+    os.getenv("SANDBOX_MEMORY_LIMIT_BYTES", str(512 * 1024 * 1024))
+)
+
+# ---------------------------------------------------------------------------
+# Token budget reserve fraction (BUG 3 fix)
+# ---------------------------------------------------------------------------
+# Fraction of MAX_TOKENS_PER_RUN that must remain *after* context injection
+# for the agent stages (Planner + Coder + Verifier).  If context consumes
+# more than (1 - reserve), the schema is truncated and a warning is emitted.
+
+CONTEXT_BUDGET_RESERVE_FRACTION: float = float(
+    os.getenv("CONTEXT_BUDGET_RESERVE_FRACTION", "0.20")
+)
 
 # ---------------------------------------------------------------------------
 # Session context management (ARCH-02)

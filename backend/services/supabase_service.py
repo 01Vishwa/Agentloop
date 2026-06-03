@@ -185,8 +185,18 @@ async def insert_file_record(record: Dict[str, Any]) -> Dict[str, Any]:
     return await asyncio.get_running_loop().run_in_executor(None, _sync)
 
 
-async def list_uploaded_files(workspace_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Fetches all rows from the ``uploaded_files`` table.
+async def list_uploaded_files(
+    user_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Fetches file rows from the ``uploaded_files`` table scoped to a user.
+
+    P2-04 fix: the ``user_id`` filter is now applied unconditionally when
+    provided, preventing cross-user file visibility in multi-tenant deployments.
+
+    Args:
+        user_id: Authenticated user ID — rows are filtered to this user only.
+        workspace_id: Optional workspace scope for additional filtering.
 
     Returns:
         List[Dict[str, Any]]: List of dataset metadata rows.
@@ -194,6 +204,8 @@ async def list_uploaded_files(workspace_id: Optional[str] = None) -> List[Dict[s
     def _sync() -> List[Dict[str, Any]]:
         client = _make_service_client()
         query = client.table("uploaded_files").select("*").order("created_at", desc=True)
+        if user_id:
+            query = query.eq("user_id", user_id)
         if workspace_id:
             query = query.eq("workspace_id", workspace_id)
         response = query.execute()
@@ -288,7 +300,7 @@ async def update_agent_run(
             "insights": insights,
             "execution_logs": execution_logs,
             "status": status,
-            "completed_at": datetime.datetime.utcnow().isoformat(),
+            "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         try:
             response = (
@@ -358,7 +370,7 @@ async def list_agent_runs(
         try:
             query = (
                 client.table("agent_runs")
-                .select("id, query, file_names, rounds, status, created_at, completed_at, eval_metrics, user_id, workspace_id")
+                .select("id, query, file_names, rounds, status, created_at, completed_at, user_id, workspace_id")
                 .order("created_at", desc=True)
                 .limit(limit)
             )
@@ -382,56 +394,6 @@ async def list_agent_runs(
 
     return await asyncio.get_running_loop().run_in_executor(None, _sync)
 
-
-async def update_agent_run_metrics(
-    run_id: str,
-    metrics: Dict[str, Any],
-    total_run_ms: int,
-    complexity: str,
-) -> Dict[str, Any]:
-    """Persists evaluation metrics onto an existing agent_run row.
-
-    Args:
-        run_id (str): Unique run identifier matching an existing agent_runs row.
-        metrics (Dict[str, Any]): RunMetrics.summary() output.
-        total_run_ms (int): Total wall-clock duration of the run in milliseconds.
-        complexity (str): Task complexity tag — ``"easy"`` or ``"hard"``.
-
-    Returns:
-        Dict[str, Any]: The updated row, or empty dict on failure.
-    """
-    def _sync() -> Dict[str, Any]:
-        client = _make_service_client()
-        updates = {
-            "eval_metrics": {
-                **metrics,
-                "total_run_ms": total_run_ms,
-                "complexity": complexity,
-            }
-        }
-        try:
-            response = (
-                client.table("agent_runs")
-                .update(updates)
-                .eq("id", run_id)
-                .execute()
-            )
-            logger.info(
-                "Persisted eval_metrics for run_id=%s — complexity=%s, total_ms=%d",
-                run_id,
-                complexity,
-                total_run_ms,
-            )
-            return response.data[0] if response.data else {}
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.warning(
-                "Could not persist eval_metrics for run_id=%s (column may not exist yet): %s",
-                run_id,
-                exc,
-            )
-            return {}
-
-    return await asyncio.get_running_loop().run_in_executor(None, _sync)
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +509,7 @@ async def link_subquestion_run(
             client.table("sub_questions").update({
                 "status": status,
                 "result_run_id": result_run_id,
-                "completed_at": datetime.datetime.utcnow().isoformat()
+                "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }).eq("id", sq_id).execute()
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("[Supabase] Could not link sub-question %s: %s", sq_id, exc)
@@ -587,7 +549,7 @@ async def update_report_status(
             "key_findings": key_findings or [],
             "caveats": caveats or [],
             "total_ms": total_ms,
-            "completed_at": datetime.datetime.utcnow().isoformat()
+            "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
         }
         try:
             client.table("reports").update(updates).eq("id", report_id).execute()
@@ -700,5 +662,170 @@ async def get_workspace_stats(user_id: str) -> Dict[str, Any]:
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("[Supabase] Could not fetch workspace stats: %s", exc)
             return {}
+
+    return await asyncio.get_running_loop().run_in_executor(None, _sync)
+
+
+# ---------------------------------------------------------------------------
+# workspace_files operations  (multi-file join feature)
+# ---------------------------------------------------------------------------
+
+async def insert_workspace_file(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Inserts one row into the ``workspace_files`` table.
+
+    Args:
+        record: Dict matching workspace_files schema keys:
+            workspace_id, user_id, file_name, file_path, file_type,
+            row_count (optional), schema_json (optional), upload_order.
+
+    Returns:
+        The inserted row as returned by Supabase.
+
+    Raises:
+        RuntimeError: If the insert fails.
+    """
+    def _sync() -> Dict[str, Any]:
+        client = _make_service_client()
+        try:
+            response = (
+                client.table("workspace_files")
+                .insert(record)
+                .execute()
+            )
+            if not response.data:
+                raise RuntimeError(
+                    f"workspace_files insert returned no data for record: {record}"
+                )
+            logger.info(
+                "[Supabase] Inserted workspace_file id=%s file=%s order=%s",
+                response.data[0].get("id"),
+                record.get("file_name"),
+                record.get("upload_order"),
+            )
+            return response.data[0]
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("[Supabase] Could not insert workspace_file: %s", exc)
+            raise RuntimeError(str(exc)) from exc
+
+    return await asyncio.get_running_loop().run_in_executor(None, _sync)
+
+
+async def list_workspace_files(
+    workspace_id: str,
+    user_id: str,
+) -> List[Dict[str, Any]]:
+    """Fetches all workspace_files rows for a given workspace, ordered by upload_order ASC.
+
+    Args:
+        workspace_id: The workspace UUID to filter by.
+        user_id: The authenticated user UUID — enforces row-level ownership.
+
+    Returns:
+        List of workspace_files rows ordered by upload_order ascending.
+    """
+    def _sync() -> List[Dict[str, Any]]:
+        client = _make_service_client()
+        try:
+            response = (
+                client.table("workspace_files")
+                .select("*")
+                .eq("workspace_id", workspace_id)
+                .eq("user_id", user_id)
+                .order("upload_order", desc=False)
+                .execute()
+            )
+            return response.data or []
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(
+                "[Supabase] Could not list workspace_files for workspace=%s: %s",
+                workspace_id,
+                exc,
+            )
+            return []
+
+    return await asyncio.get_running_loop().run_in_executor(None, _sync)
+
+
+async def count_workspace_files(workspace_id: str, user_id: str) -> int:
+    """Returns the count of existing workspace_files rows for a workspace.
+
+    Used to determine the next upload_order value (count + 1).
+
+    Args:
+        workspace_id: The workspace UUID.
+        user_id: The authenticated user UUID.
+
+    Returns:
+        Integer count of existing rows (0 if none).
+    """
+    def _sync() -> int:
+        client = _make_service_client()
+        try:
+            response = (
+                client.table("workspace_files")
+                .select("id", count="exact")
+                .eq("workspace_id", workspace_id)
+                .eq("user_id", user_id)
+                .execute()
+            )
+            return response.count or 0
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(
+                "[Supabase] Could not count workspace_files for workspace=%s: %s",
+                workspace_id,
+                exc,
+            )
+            return 0
+
+    return await asyncio.get_running_loop().run_in_executor(None, _sync)
+
+
+async def delete_workspace_file(
+    file_id: str,
+    workspace_id: str,
+    user_id: str,
+) -> bool:
+    """Deletes a single workspace_files row after verifying ownership.
+
+    Args:
+        file_id: UUID of the workspace_files row to delete.
+        workspace_id: Must match the row's workspace_id (ownership check).
+        user_id: Must match the row's user_id (ownership check).
+
+    Returns:
+        True if a row was deleted, False if not found or not owned by user.
+    """
+    def _sync() -> bool:
+        client = _make_service_client()
+        try:
+            response = (
+                client.table("workspace_files")
+                .delete()
+                .eq("id", file_id)
+                .eq("workspace_id", workspace_id)
+                .eq("user_id", user_id)
+                .execute()
+            )
+            deleted = bool(response.data)
+            if deleted:
+                logger.info(
+                    "[Supabase] Deleted workspace_file id=%s from workspace=%s",
+                    file_id,
+                    workspace_id,
+                )
+            else:
+                logger.warning(
+                    "[Supabase] workspace_file id=%s not found or not owned by user=%s",
+                    file_id,
+                    user_id,
+                )
+            return deleted
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(
+                "[Supabase] Could not delete workspace_file id=%s: %s",
+                file_id,
+                exc,
+            )
+            return False
 
     return await asyncio.get_running_loop().run_in_executor(None, _sync)

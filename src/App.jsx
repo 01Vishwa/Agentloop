@@ -24,7 +24,7 @@ import { LandingPage } from './pages/LandingPage'
 import { ProjectsPage } from './pages/ProjectsPage'
 import { HomePage } from './pages/HomePage'
 import { ToastContainer } from './components/shared/Toast'
-import { EvalDashboard } from './pages/EvalDashboard'
+
 import { useFileUpload } from './hooks/useFileUpload'
 import { useAgentRun } from './hooks/useAgentRun'
 import './index.css'
@@ -62,7 +62,7 @@ function ProtectedRoute({ children }) {
  *  - Clean agent state per project
  */
 function ProjectWorkspace() {
-  const { projectId } = useParams()
+  useParams() // projectId used as React key in ProjectWorkspaceRoute
   const fileState = useFileUpload()
   const agentState = useAgentRun(fileState.files)
 
@@ -88,11 +88,7 @@ function AppInner() {
             <ProjectWorkspaceRoute />
           </ProtectedRoute>
         } />
-        <Route path="/eval" element={
-          <ProtectedRoute>
-            <EvalDashboard />
-          </ProtectedRoute>
-        } />
+
       </Routes>
       <ToastContainer />
     </>
