@@ -1,17 +1,7 @@
 """General utility functions and helpers."""
 
 import math
-import uuid
 from typing import Any
-
-
-def generate_id() -> str:
-    """Generates a random unique identifier string.
-
-    Returns:
-        str: A randomly generated UUID string.
-    """
-    return str(uuid.uuid4())
 
 
 def sanitize_floats(obj: Any) -> Any:

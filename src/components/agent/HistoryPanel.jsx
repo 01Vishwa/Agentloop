@@ -46,18 +46,6 @@ function StatusBadge({ status }) {
   )
 }
 
-function ComplexityBadge({ complexity }) {
-  if (!complexity) return null
-  const isHard = complexity === 'hard'
-  return (
-    <span className={`inline-flex px-1.5 py-0.2 rounded border text-[9px] font-bold uppercase ${
-      isHard ? 'bg-rose-50 text-rose-600 border-rose-100' : 'bg-sky-50 text-sky-600 border-sky-100'
-    }`}>
-      {isHard ? 'Hard' : 'Easy'}
-    </span>
-  )
-}
-
 // ─── Single run row ───────────────────────────────────────────────────────────
 function RunRow({ run, onLoad, isLoading }) {
   const date = run.created_at
@@ -95,12 +83,6 @@ function RunRow({ run, onLoad, isLoading }) {
           {run.rounds > 0 && (
             <span className="text-[10px] text-slate-400 font-medium">· {run.rounds} round(s)</span>
           )}
-          {run.eval_metrics?.total_run_ms > 0 && (
-            <span className="text-[10px] text-slate-400 font-medium">
-              · {Math.round(run.eval_metrics.total_run_ms / 1000)}s
-            </span>
-          )}
-          <ComplexityBadge complexity={run.eval_metrics?.complexity} />
           <div className="ml-auto">
             <StatusBadge status={run.status} />
           </div>

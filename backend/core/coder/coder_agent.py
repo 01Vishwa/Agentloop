@@ -170,20 +170,100 @@ def _is_data_distribution_query(query: str) -> bool:
     )
 
 
-def _build_distribution_fallback_script() -> str:
+def _extract_target_columns(
+    query: str, known_columns: Sequence[str]
+) -> List[str]:
+    """Extracts column names the user explicitly mentioned from their query.
+
+    Cross-references the query text against the known schema columns
+    (case-insensitive) and returns a list of matched column names in
+    their original casing.
+
+    This allows fallback scripts to target only the columns the user
+    asked about instead of plotting everything generically.
+
+    Examples:
+        >>> _extract_target_columns("show distribution of speed", ["hp", "speed", "attack"])
+        ['speed']
+        >>> _extract_target_columns("histogram of hp and attack", ["hp", "speed", "attack"])
+        ['hp', 'attack']
+        >>> _extract_target_columns("explore data", ["hp", "speed", "attack"])
+        []
+
+    Args:
+        query: The user's natural language query.
+        known_columns: Column names from the schema hints.
+
+    Returns:
+        List of matched column names in their original casing.
+    """
+    if not query or not known_columns:
+        return []
+    q_lower = query.lower()
+    matched: List[str] = []
+    for col in known_columns:
+        # Skip very short column names (1-2 chars) to avoid false positives
+        # e.g. "hp" matching inside "chart" — but "hp" is a common column
+        # name so we only skip single-char names.
+        if len(col) < 2:
+            continue
+        if col.lower() in q_lower:
+            matched.append(col)
+    return matched
+
+
+def _build_distribution_fallback_script(
+    target_columns: Optional[List[str]] = None,
+) -> str:
     """Builds a deterministic data-distribution script.
 
     Used as an emergency fallback when the LLM endpoint repeatedly fails.
     Discovers all tabular files in the working directory, prints .describe(),
-    value counts for categorical columns, and saves interactive Plotly HTML
-    histograms for numeric ones.
+    and saves Plotly PNG charts.
 
-    Uses plotly (pre-installed) instead of matplotlib (not available in sandbox).
+    When ``target_columns`` is provided (extracted from the user's query),
+    the script plots ONLY those specific columns. When empty/None, it falls
+    back to plotting the first 6 numeric columns generically.
+
+    Uses plotly + kaleido (pre-installed) instead of matplotlib (not available in sandbox).
 
     IMPORTANT: This function must produce a syntactically valid Python script.
     Avoid embedding literal newlines inside f-string quotes — use separate
     print() calls or string concatenation instead.
+
+    Args:
+        target_columns: Optional list of specific column names to plot.
+            When provided, only these columns are visualized.
     """
+    # Build the column-selection logic based on whether we have targets
+    if target_columns:
+        # Targeted mode: only plot the user-requested columns
+        cols_literal = repr(target_columns)
+        col_selection = (
+            f"                _target = {cols_literal}\n"
+            "                # Match target columns case-insensitively\n"
+            "                _cols_lower = {c.lower(): c for c in df.columns}\n"
+            "                cols_to_plot = []\n"
+            "                for t in _target:\n"
+            "                    actual = _cols_lower.get(t.lower())\n"
+            "                    if actual is not None:\n"
+            "                        cols_to_plot.append(actual)\n"
+            "                    else:\n"
+            "                        print('WARNING: column ' + repr(t) + ' not found. Available: ' + str(df.columns.tolist()))\n"
+            "                if not cols_to_plot:\n"
+            "                    print('No matching columns found — falling back to first 6 numeric.')\n"
+            "                    num_cols = df.select_dtypes(include='number').columns.tolist()\n"
+            "                    cols_to_plot = num_cols[:6]\n"
+        )
+        chart_title_expr = "'Distribution of ' + ', '.join(cols_to_plot)"
+    else:
+        # Generic mode: plot first 6 numeric columns
+        col_selection = (
+            "                num_cols = df.select_dtypes(include='number').columns.tolist()\n"
+            "                cols_to_plot = num_cols[:6]\n"
+        )
+        chart_title_expr = "'Data Distribution: ' + fname"
+
     return (
         "import os\n"
         "import pandas as pd\n"
@@ -234,19 +314,18 @@ def _build_distribution_fallback_script() -> str:
         "            print('Descriptive Statistics:')\n"
         "            print(df.describe(include='all').to_string())\n"
         "\n"
-        "            # ── Plotly: numeric distributions ──\n"
+        "            # ── Plotly: distributions ──\n"
         "            if _HAS_PLOTLY:\n"
-        "                num_cols = df.select_dtypes(include='number').columns.tolist()\n"
-        "                if num_cols:\n"
-        "                    n_plots = min(len(num_cols), 6)\n"
-        "                    cols_to_plot = num_cols[:n_plots]\n"
+        + col_selection +
+        "                if cols_to_plot:\n"
+        "                    n_plots = len(cols_to_plot)\n"
         "                    fig = sp.make_subplots(\n"
         "                        rows=n_plots, cols=1,\n"
         "                        subplot_titles=['Distribution of ' + c for c in cols_to_plot],\n"
         "                        vertical_spacing=0.06,\n"
         "                    )\n"
         "                    for i, col in enumerate(cols_to_plot, start=1):\n"
-        "                        series = df[col].dropna()\n"
+        "                        series = pd.to_numeric(df[col], errors='coerce').dropna()\n"
         "                        fig.add_trace(\n"
         "                            go.Histogram(x=series, nbinsx=30, name=col,\n"
         "                                         marker_color='#636EFA'),\n"
@@ -255,38 +334,16 @@ def _build_distribution_fallback_script() -> str:
         "                        fig.update_xaxes(title_text=col, row=i, col=1)\n"
         "                        fig.update_yaxes(title_text='Frequency', row=i, col=1)\n"
         "                    fig.update_layout(\n"
-        "                        title_text='Data Distribution: ' + fname,\n"
+        f"                        title_text={chart_title_expr},\n"
         "                        height=350 * n_plots,\n"
         "                        showlegend=False,\n"
         "                        template='plotly_white',\n"
         "                    )\n"
         "                    base = fname.rsplit('.', 1)[0]\n"
-        "                    chart_name = 'distribution_' + base + '.html'\n"
-        "                    fig.write_html('./outputs/' + chart_name)\n"
+        "                    chart_name = 'distribution_' + base + '.png'\n"
+        "                    fig.write_image('./outputs/' + chart_name)\n"
         "                    print('')\n"
-        "                    print('Interactive distribution chart saved to ./outputs/' + chart_name)\n"
-        "\n"
-        "                # ── Plotly: categorical value counts ──\n"
-        "                cat_cols = [c for c in df.columns\n"
-        "                            if df[c].dtype == object or str(df[c].dtype) == 'string']\n"
-        "                for col in cat_cols[:4]:\n"
-        "                    vc = df[col].value_counts().head(15)\n"
-        "                    fig_cat = px.bar(\n"
-        "                        x=vc.index.astype(str), y=vc.values,\n"
-        "                        labels={'x': col, 'y': 'Count'},\n"
-        "                        title='Value Counts: ' + col,\n"
-        "                        template='plotly_white',\n"
-        "                    )\n"
-        "                    cat_chart = 'valuecounts_' + col[:30] + '_' + base + '.html'\n"
-        "                    fig_cat.write_html('./outputs/' + cat_chart)\n"
-        "                    print('Category chart saved to ./outputs/' + cat_chart)\n"
-        "            else:\n"
-        "                # Plain-text fallback when plotly is also missing\n"
-        "                cat_cols = df.select_dtypes(include='object').columns.tolist()\n"
-        "                for col in cat_cols[:5]:\n"
-        "                    print('')\n"
-        "                    print(\"Value counts for '\" + col + \"':\")\n"
-        "                    print(df[col].value_counts().head(10).to_string())\n"
+        "                    print('Distribution chart saved to ./outputs/' + chart_name)\n"
         "\n"
         "        except Exception as exc:\n"
         "            print(str(fname) + ': failed to process (' + str(exc) + ')')\n"
@@ -501,21 +558,22 @@ EXECUTION MODEL — Read this carefully:
 
 TASK TYPE OUTPUT MODES:
 - Insight / Data Analysis: print() final numeric answers clearly.
-- Visualization: save interactive charts with fig.write_html('./outputs/<name>.html')
-  (uses plotly — matplotlib is NOT available).
+- Visualization: save charts as PNG images with fig.write_image('./outputs/<name>.png')
+  (uses plotly + kaleido — matplotlib is NOT available).
 - Data Wrangling: save cleaned data with df.to_csv('./outputs/<name>.csv', index=False)
 - Machine Learning: save the model with joblib.dump(model, './outputs/model.joblib')
   AND print metrics (accuracy, RMSE, etc.)
 
 GENERAL RULES:
 - PRE-INSTALLED PACKAGES (use freely): pandas, numpy, scipy, sklearn, joblib,
-  plotly, Pillow (PIL), and the Python standard library.
+  plotly, kaleido, Pillow (PIL), and the Python standard library.
 - NOT INSTALLED — NEVER import these: matplotlib, seaborn, statsmodels.
   If you must use visualization, always use plotly (plotly.express or plotly.graph_objects).
 - Read files by filename — files are pre-injected into the working directory.
-- For plots: use plotly.express or plotly.graph_objects. Save with
-  fig.write_html('./outputs/<name>.html') OR fig.write_image('./outputs/<name>.png')
-  (write_image requires kaleido — prefer write_html which always works).
+- For plots: use plotly.express or plotly.graph_objects. ALWAYS save as PNG:
+  fig.write_image('./outputs/<name>.png')
+  Do NOT use fig.write_html() — the UI cannot display HTML artifacts inline.
+  kaleido is pre-installed so write_image() always works.
   NEVER call plt.show() or import matplotlib.
 - The ./outputs/ directory is pre-created.
 - Handle missing values gracefully with pd.to_numeric(..., errors='coerce').
@@ -548,6 +606,23 @@ IMPORTANT — Robust data handling:
 - Coerce numerics: pd.to_numeric(df['col'], errors='coerce')
 - Drop NaN before stats: df.dropna(subset=['col1', 'col2'])
 - NEVER silently output NaN as the final result.
+
+MULTI-FILE MERGE RULES — apply ONLY when the MULTI-FILE CONTEXT block is present:
+- The data-loading header (df1 = pd.read_csv(...), df2 = ...) is ALREADY
+  provided at the top of the script. DO NOT re-load the files.
+- When a merge is required, use EXPLICIT left_on/right_on parameters:
+    merged = pd.merge(df1, df2, left_on='<left_col>', right_on='<right_col>', how='inner')
+  Never use 'on=' alone when the column names differ between files.
+- After every pd.merge(), immediately print the resulting shape:
+    print(f'merged shape: {{merged.shape}}')
+  If merged.shape[0] == 0, print a warning and stop gracefully.
+- Prefer the highest-confidence join candidate from the MULTI-FILE CONTEXT
+  unless the user's query explicitly names different columns.
+- Validate that the join columns exist in BOTH DataFrames before merging:
+    for _df, _col, _name in [(df1, '<left_col>', 'df1'), (df2, '<right_col>', 'df2')]:
+        if _col not in _df.columns:
+            print(f'ERROR: {{_col!r}} not in {{_name}}: {{_df.columns.tolist()}}')
+            raise KeyError(_col)
 """
 
 _CODER_HUMAN = """\
@@ -740,6 +815,7 @@ class CoderAgent:
         execution_output: str = "",
         schema_hints: str = "",
         token_tracker: Optional[TokenTracker] = None,
+        multi_file_context=None,  # Optional[MultiFileContext]
     ) -> str:
         """Generates a Python script implementing the analysis plan.
 
@@ -765,12 +841,30 @@ class CoderAgent:
         # Cap execution output passed to coder to avoid context window exhaustion
         trimmed_exec = execution_output[:_MAX_EXEC_OUTPUT_CHARS] if execution_output else "(none)"
 
+        # Multi-file: prepend the deterministic data-loading header to previous_code
+        # so the coder extends it rather than writing its own pd.read_* calls.
+        effective_previous_code = previous_code
+        if multi_file_context is not None and len(multi_file_context.files) >= 2:
+            if not previous_code or previous_code.strip() in ("", "(none — this is round 1, write from scratch)"):
+                # Round 1: inject the reader header as the starting script
+                reader_header = multi_file_context.to_reader_header(
+                    workspace_id=""
+                )
+                effective_previous_code = reader_header
+                # Also extend data_description with join context
+                join_block = (
+                    "\n\nMULTI-FILE CONTEXT:\n"
+                    + multi_file_context.to_prompt_str()
+                    + "\n"
+                )
+                data_description = data_description + join_block
+
         invoke_input = {
             "query": query,
             "data_description": data_description,
             "schema_hints": schema_hints or "(none provided)",
             "plan_steps": formatted_steps,
-            "previous_code": previous_code or "(none — this is round 1, write from scratch)",
+            "previous_code": effective_previous_code or "(none — this is round 1, write from scratch)",
             "execution_output": trimmed_exec,
         }
 
@@ -860,11 +954,15 @@ class CoderAgent:
                         return _build_column_listing_fallback_script(known_columns).strip()
 
                     if _is_data_distribution_query(query):
+                        _target_cols = _extract_target_columns(query, known_columns)
                         logger.warning(
                             "[Coder] Raw completion failed twice for distribution query; "
-                            "using deterministic fallback script."
+                            "using deterministic fallback script (target_cols=%s).",
+                            _target_cols or "all",
                         )
-                        return _build_distribution_fallback_script().strip()
+                        return _build_distribution_fallback_script(
+                            target_columns=_target_cols or None
+                        ).strip()
 
                     raise ValueError(
                         "[Coder] Raw completion failed (primary + fresh fallback). "
@@ -961,11 +1059,15 @@ class CoderAgent:
                             )
                             return _build_column_listing_fallback_script(known_columns).strip()
                         if _is_data_distribution_query(query):
+                            _target_cols = _extract_target_columns(query, known_columns)
                             logger.warning(
                                 "[Coder] Structured+raw fallback failed for distribution query; "
-                                "using deterministic fallback script."
+                                "using deterministic fallback script (target_cols=%s).",
+                                _target_cols or "all",
                             )
-                            return _build_distribution_fallback_script().strip()
+                            return _build_distribution_fallback_script(
+                                target_columns=_target_cols or None
+                            ).strip()
                         raise ValueError(
                             f"[Coder] Structured output + raw fallback both failed. "
                             f"Structured error: {exc_payload[:150]}, "

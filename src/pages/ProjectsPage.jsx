@@ -10,7 +10,7 @@ import { useWorkspaceStore } from '../stores/workspaceStore'
 import { supabase } from '../lib/supabaseClient'
 
 export function ProjectsPage() {
-  const { user, signOut, isAuthenticated, loading: authLoading, getAccessToken } = useAuth()
+  const { user, signOut, isAuthenticated, loading: authLoading } = useAuth()
   const { workspaces, loading: wsLoading, fetchWorkspaces, createWorkspace, setActiveWorkspace } = useWorkspaceStore()
   const navigate = useNavigate()
 
@@ -23,7 +23,7 @@ export function ProjectsPage() {
   const [searchQuery, setSearchQuery] = useState('')
   const [sortConfig, setSortConfig] = useState({ key: 'created_at', direction: 'desc' })
   const [currentPage, setCurrentPage] = useState(1)
-  const itemsPerPage = 10
+  const itemsPerPage = 5
 
   // Filtering and Sorting logic
   const filteredAndSortedWorkspaces = useMemo(() => {
@@ -148,7 +148,7 @@ export function ProjectsPage() {
   }
 
   return (
-    <div className="min-h-screen font-sans bg-[#f8fafc] text-slate-800 relative">
+    <div className="h-screen flex flex-col font-sans bg-[#f8fafc] text-slate-800 relative">
       {/* Navbar */}
       <header className="relative z-20 border-b border-slate-200/80 bg-white/70 backdrop-blur-md">
         <div className="max-w-[1200px] mx-auto px-6 py-3 flex items-center justify-between">
@@ -178,7 +178,8 @@ export function ProjectsPage() {
       </header>
 
       {/* Main Content */}
-      <main className="max-w-[1200px] mx-auto px-6 py-12 relative z-10">
+      <main className="flex-1 overflow-y-auto">
+        <div className="max-w-[1200px] mx-auto px-6 py-12 relative z-10">
         <div className="flex items-center justify-between mb-10">
           <div>
             <h1 className="text-3xl font-extrabold text-slate-900 tracking-tight">Your Projects</h1>
@@ -257,7 +258,7 @@ export function ProjectsPage() {
         ) : (
           !isCreating && (
             <div className="glass-card-elevated overflow-hidden border border-slate-200 bg-white shadow-sm rounded-2xl">
-              <div className="overflow-x-auto overflow-y-auto max-h-[60vh]">
+              <div className="overflow-x-auto">
                 <table className="w-full text-left border-collapse min-w-[700px]">
                   <thead className="sticky top-0 z-10 shadow-sm">
                     <tr className="border-b border-slate-200 bg-slate-50">
@@ -369,7 +370,16 @@ export function ProjectsPage() {
             </div>
           )
         )}
+        </div>
       </main>
+
+      {/* Footer */}
+      <footer className="shrink-0 relative z-10 border-t border-slate-200/80 bg-white/60 backdrop-blur-sm">
+        <div className="max-w-[1200px] mx-auto px-6 py-4 flex items-center justify-between text-[12px] text-slate-400 font-medium">
+          <span>© {new Date().getFullYear()} Agentloop. All rights reserved.</span>
+          <span>Intelligent Document Processing</span>
+        </div>
+      </footer>
     </div>
   )
 }

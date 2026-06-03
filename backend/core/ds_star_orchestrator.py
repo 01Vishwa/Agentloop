@@ -7,7 +7,6 @@ SSE streaming to the frontend.
 Gap fixes applied:
 - Lambda capture bug fixed: coro_factory args now captured at call-site via
   functools.partial / default-argument binding instead of closure.
-- run_id correctly passed into RunMetrics (was always empty string).
 - Complexity classification now uses a heuristic (file count + query keywords)
   rather than a pure file-count label.
 - REMOVE_STEPS router action now wired to PlannerAgent.remove_steps_from().
@@ -39,9 +38,8 @@ from core.finalizer.finalizer_agent import FinalizerAgent
 from core.planner.planner_agent import PlannerAgent
 from core.router.router_agent import RouterAgent
 from core.verifier.verifier_agent import VerifierAgent
-from core.config import MAX_AGENT_ROUNDS, MAX_DEBUGGER_RETRIES, MAX_TOKENS_PER_RUN
+from core.config import MAX_AGENT_ROUNDS, MAX_DEBUGGER_RETRIES, MAX_TOKENS_PER_RUN, CONTEXT_BUDGET_RESERVE_FRACTION
 from core.token_tracker import TokenTracker
-from models.metrics_schema import RoundMetric, RoundTimingCollector, RunMetrics
 
 logger = logging.getLogger("uvicorn.info")
 
@@ -244,6 +242,8 @@ class DsStarOrchestrator:
         context: Dict[str, Any],
         run_id: str = "",
         session_id: str = "__anon__",
+        max_rounds: Optional[int] = None,
+        workspace_id: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Executes the DS-STAR loop and yields SSE events.
 
@@ -254,15 +254,22 @@ class DsStarOrchestrator:
             run_id: Unique run identifier for metrics (passed from controller).
             session_id: Client session identifier — used to scope file cache
                 access so the executor only sees this session's uploaded files.
+            max_rounds: Per-call round limit. When provided, overrides
+                ``self._max_rounds`` for this invocation only so concurrent
+                requests with different limits share the cached instance safely
+                (P1-01 fix: no mutation of shared state).
+            workspace_id: Optional workspace UUID. Forwarded to the executor
+                so it can load files from disk when the session cache is empty.
 
         Yields:
             AgentEvent dicts for SSE streaming.
         """
+        # Resolve effective max_rounds locally — never write to self._max_rounds
+        _effective_max_rounds: int = max_rounds if max_rounds is not None else self._max_rounds
         run_t0 = time.monotonic()
         execution_logs: List[str] = []
         combined = context.get("combined_extractions", {})
         pending_retry_events: List[Dict] = []
-        round_metrics: List[RoundMetric] = []
 
         file_count = len(combined)
         complexity = _classify_complexity(file_count, query)
@@ -288,6 +295,39 @@ class DsStarOrchestrator:
         execution_logs.append(
             f"[FileAnalyzer] {len(data_description)} chars of data description generated."
         )
+
+        # ── BUG 3 fix: Context token-budget guard ────────────────────────────
+        # Estimate token consumption of the schema context using the standard
+        # ~4 chars-per-token heuristic.  If injecting the full context would
+        # leave less than CONTEXT_BUDGET_RESERVE_FRACTION of the total budget
+        # for downstream agent stages (Planner, Coder, Verifier, etc.) we
+        # truncate data_description to the max char count that fits within the
+        # safe window and surface a user-facing SSE warning instead of silently
+        # proceeding and then hitting the hard cap mid-run.
+        _CHARS_PER_TOKEN = 4  # conservative heuristic for mixed code/text
+        _total_budget = MAX_TOKENS_PER_RUN
+        _reserved_tokens = int(_total_budget * CONTEXT_BUDGET_RESERVE_FRACTION)
+        _context_token_estimate = len(data_description) // _CHARS_PER_TOKEN
+        _safe_context_tokens = _total_budget - _reserved_tokens
+
+        if _context_token_estimate > _safe_context_tokens:
+            _max_chars = _safe_context_tokens * _CHARS_PER_TOKEN
+            data_description = data_description[:_max_chars]
+            _trunc_msg = (
+                f"Schema context was too large ({_context_token_estimate:,} estimated tokens). "
+                f"Truncated to {_safe_context_tokens:,} tokens to preserve a "
+                f"{int(CONTEXT_BUDGET_RESERVE_FRACTION * 100)}% budget reserve "
+                f"({_reserved_tokens:,} tokens) for agent stages."
+            )
+            execution_logs.append(f"[BudgetGuard] {_trunc_msg}")
+            logger.warning("[Orchestrator] %s", _trunc_msg)
+            yield _event(
+                "context_truncated",
+                message=_trunc_msg,
+                original_tokens=_context_token_estimate,
+                truncated_to_tokens=_safe_context_tokens,
+                reserved_tokens=_reserved_tokens,
+            )
 
         # ── Stage 2: Initial Plan ─────────────────────────────────────────────
         yield _event("planning", message="Creating initial analysis plan…")
@@ -340,11 +380,8 @@ class DsStarOrchestrator:
         consecutive_coder_schema_errors = 0
         coder_raw_mode_engaged = False  # idempotent guard for force_raw_completion()
 
-        for round_num in range(1, self._max_rounds + 1):
+        for round_num in range(1, _effective_max_rounds + 1):
             rounds_completed = round_num
-            timing = RoundTimingCollector(round_num=round_num)
-            if round_num == 1:
-                timing.record("planner", planner_ms + analyzer_ms)
 
             # ── Token budget check (Gap 4) ─────────────────────────────────
             if token_tracker.over_budget():
@@ -359,9 +396,9 @@ class DsStarOrchestrator:
 
             yield _event(
                 "round_start",
-                message=f"Round {round_num}/{self._max_rounds}",
+                message=f"Round {round_num}/{_effective_max_rounds}",
                 round=round_num,
-                max_rounds=self._max_rounds,
+                max_rounds=_effective_max_rounds,
             )
 
             # ── 3a. Code Generation ───────────────────────────────────────────
@@ -400,7 +437,6 @@ class DsStarOrchestrator:
                     yield ev
                 pending_retry_events.clear()
                 consecutive_coder_schema_errors = 0
-                timing.record("coder", _ms_since(coder_t0))
                 yield _event(
                     "code_ready",
                     message="Code generated.",
@@ -411,7 +447,6 @@ class DsStarOrchestrator:
                 for ev in pending_retry_events:
                     yield ev
                 pending_retry_events.clear()
-                timing.record("coder", _ms_since(coder_t0))
                 exc_str = str(exc)
                 execution_logs.append(
                     f"[Round {round_num}] Coder exhausted retries: {exc_str}"
@@ -527,10 +562,11 @@ class DsStarOrchestrator:
                 _iter_t0 = time.monotonic()  # ARCH-06: time each attempt individually
                 try:
                     last_exec_result = await self.executor.run(
-                        _code_to_run, session_id=session_id
+                        _code_to_run,
+                        session_id=session_id,
+                        workspace_id=workspace_id,
                     )
                     _total_exec_ms += _ms_since(_iter_t0)
-                    timing.record("executor", _total_exec_ms)
                     exec_summary = (
                         f"[Round {round_num}] Execution "
                         f"{'succeeded' if last_exec_result.success else 'failed'}."
@@ -548,7 +584,6 @@ class DsStarOrchestrator:
                         stderr=last_exec_result.stderr[:500],
                         success=last_exec_result.success,
                         round=round_num,
-                        executor_ms=timing.get("executor"),
                     )
 
                     # Emit artifact events
@@ -618,7 +653,6 @@ class DsStarOrchestrator:
 
                 except Exception as exc:  # pylint: disable=broad-except
                     _total_exec_ms += _ms_since(_iter_t0)
-                    timing.record("executor", _total_exec_ms)
                     last_exec_result = ExecutionResult("", str(exc), 1)
                     execution_logs.append(f"[Round {round_num}] Executor crash: {exc}")
                     yield _event("warning", message=f"Executor crash: {exc}")
@@ -658,7 +692,6 @@ class DsStarOrchestrator:
                 for ev in pending_retry_events:
                     yield ev
                 pending_retry_events.clear()
-                timing.record("verifier", _ms_since(verifier_t0))
                 execution_logs.append(
                     f"[Round {round_num}] Verifier: sufficient={verification['is_sufficient']}, "
                     f"reason={verification['reason'][:80]}"
@@ -673,13 +706,11 @@ class DsStarOrchestrator:
                     reason=verification["reason"],
                     confidence=verification.get("confidence", 0.5),
                     round=round_num,
-                    verifier_ms=timing.get("verifier"),
                 )
             except Exception as exc:  # pylint: disable=broad-except
                 for ev in pending_retry_events:
                     yield ev
                 pending_retry_events.clear()
-                timing.record("verifier", _ms_since(verifier_t0))
                 verification = {
                     "is_sufficient": False,
                     "reason": str(exc),
@@ -689,12 +720,6 @@ class DsStarOrchestrator:
                     f"[Round {round_num}] Verifier exhausted retries: {exc}"
                 )
                 yield _event("warning", message=f"Verifier error: {exc}")
-
-            round_metrics.append(timing.build(
-                is_sufficient=verification["is_sufficient"],
-                verifier_confidence=verification.get("confidence", 0.0),
-                exec_success=last_exec_result.success,
-            ))
 
             if verification["is_sufficient"]:
                 rounds_until_sufficient = round_num
@@ -730,7 +755,6 @@ class DsStarOrchestrator:
                     for ev in pending_retry_events:
                         yield ev
                     pending_retry_events.clear()
-                    timing.record("router", _ms_since(router_t0))
 
                     action = decision.get("action", "ADD_STEP")
                     step_index = decision.get("step_index")
@@ -804,13 +828,11 @@ class DsStarOrchestrator:
                         steps=plan_steps,
                         action=action,
                         round=round_num,
-                        router_ms=timing.get("router"),
                     )
                 except Exception as exc:  # pylint: disable=broad-except
                     for ev in pending_retry_events:
                         yield ev
                     pending_retry_events.clear()
-                    timing.record("router", _ms_since(router_t0))
                     execution_logs.append(
                         f"[Round {round_num}] Router error: {exc}"
                     )
@@ -818,21 +840,6 @@ class DsStarOrchestrator:
 
         # ── Stage 4: Evaluation Metrics ───────────────────────────────────────
         total_run_ms = _ms_since(run_t0)
-        final_status = (
-            "completed" if verification.get("is_sufficient") else "max_rounds_reached"
-        )
-        run_metrics = RunMetrics(
-            run_id=run_id,   # FIX: was always "" — now passed from controller
-            query=query,
-            complexity=complexity,
-            file_count=file_count,
-            rounds_completed=rounds_completed,
-            rounds_until_sufficient=rounds_until_sufficient or rounds_completed,
-            total_run_ms=total_run_ms,
-            final_status=final_status,
-            rounds=round_metrics,
-        )
-
         # ── Stage 5: Finalize ─────────────────────────────────────────────────
         artifact_names_final = list(last_exec_result.artifacts.keys())
 
@@ -884,14 +891,6 @@ class DsStarOrchestrator:
             "completed",
             message=f"DS-STAR analysis complete in {rounds_completed} round(s).",
             **final_result,
-        )
-
-        yield _event(
-            "metrics",
-            message="Run evaluation metrics captured.",
-            metrics=run_metrics.summary(),
-            total_run_ms=total_run_ms,
-            complexity=complexity,
         )
 
         logger.info(

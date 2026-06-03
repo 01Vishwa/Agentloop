@@ -1,11 +1,11 @@
 import React, { useCallback } from 'react'
-import { UploadCloud, Trash2, FolderOpen, FolderKanban } from 'lucide-react'
+import { UploadCloud, Trash2, FolderOpen, FolderKanban, Loader2 } from 'lucide-react'
 import { DropZone } from './DropZone'
 import { FileList } from './FileList'
 import { toast } from '../shared/Toast'
 import { useWorkspaceStore } from '../../stores/workspaceStore'
 
-export function FileUploadPanel({ files, onAddFiles, onRemoveFile, onClearAll }) {
+export function FileUploadPanel({ files, filesLoading, onAddFiles, onRemoveFile, onClearAll }) {
   const handleRejected = useCallback((rejectedFiles) => {
     rejectedFiles.forEach((r) => toast(`"${r.name}" — ${r.reason}`, 'error'))
   }, [])
@@ -57,6 +57,11 @@ export function FileUploadPanel({ files, onAddFiles, onRemoveFile, onClearAll })
       {/* File List */}
       {files.length > 0 ? (
         <FileList files={files} onRemove={onRemoveFile} />
+      ) : filesLoading ? (
+        <div className="flex-1 flex flex-col items-center justify-center text-center py-8 opacity-60">
+          <Loader2 size={28} className="text-brand-400 mb-2 animate-spin" />
+          <p className="text-xs text-slate-400 font-medium">Loading files…</p>
+        </div>
       ) : (
         <div className="flex-1 flex flex-col items-center justify-center text-center py-8 opacity-60">
           <UploadCloud size={32} className="text-slate-300 mb-2" />

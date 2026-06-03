@@ -99,8 +99,8 @@ flowchart TD
 |---|---|
 | **Frontend** | React 19, Vite, Tailwind CSS, Lucide React |
 | **State / Auth** | Zustand, `@supabase/supabase-js` |
-| **Backend** | FastAPI, Python 3.10+, PyJWT, Tenacity, asyncio |
-| **AI / LLM** | LangChain, `langchain-nvidia-ai-endpoints` (NVIDIA NIM) |
+| **Backend** | FastAPI, Python 3.10+, PyJWT, Pydantic, Tenacity, asyncio |
+| **AI / LLM** | LangChain (LCEL), `langchain-nvidia-ai-endpoints` (NVIDIA NIM) |
 | **Execution** | Subprocess sandbox (Docker-ready, Data Science env equipped) |
 | **Database / Auth** | Supabase (PostgreSQL + Row-Level Security) |
 
@@ -114,7 +114,23 @@ Agentloop/
 │   ├── api/
 │   │   ├── controllers/       # Business logic controllers
 │   │   └── routes.py          # FastAPI router — thin endpoint declarations
-│   ├── core/                  # DS-STAR Orchestrator, Planner, Coder, Verifier…
+│   ├── core/                  # DS-STAR orchestrators & core modules
+│   │   ├── analyzer/          # Data schema normalizer
+│   │   ├── coder/             # Code generation agent
+│   │   ├── debugger/          # Error recovery agent
+│   │   ├── ds_star_plus/      # Deep Research extensions (ReportWriter, SubQuestion)
+│   │   ├── executor/          # Code sandbox execution
+│   │   ├── finalizer/         # Insight extraction agent
+│   │   ├── planner/           # Multi-step reasoning agent
+│   │   ├── retrieval/         # Vector search agent
+│   │   ├── router/            # Control flow agent
+│   │   ├── verifier/          # Output validation agent
+│   │   ├── ds_star_orchestrator.py        # Main execution loop
+│   │   ├── deep_research_orchestrator.py  # DS-STAR+ parallel orchestrator
+│   │   ├── token_tracker.py               # Token & cost telemetry
+│   │   ├── validation.py                  # State transitions validation
+│   │   ├── config.py                      # Core configuration
+│   │   └── llm_client.py                  # LangChain wrapper
 │   ├── db/
 │   │   ├── create_workspaces.sql              # Workspaces table + RLS
 │   │   ├── create_uploaded_files.sql          # File metadata table + RLS
@@ -127,7 +143,9 @@ Agentloop/
 │   ├── middleware/
 │   │   ├── auth.py            # JWT dependency (get_current_user / get_optional_user)
 │   │   └── error_handler.py   # Global exception handler
-│   ├── models/                # Pydantic request/response schemas
+│   ├── models/                
+│   │   ├── schemas.py         # Pydantic request/response schemas
+│   │   └── metrics_schema.py  # Evaluation & trace metrics schemas
 │   ├── services/
 │   │   └── supabase_service.py  # Supabase client + all DB/Storage ops
 │   ├── tests/
@@ -188,17 +206,6 @@ Agentloop uses **Supabase JWT authentication** end-to-end:
 3. **Backend**: `get_current_user` FastAPI dependency decodes and verifies the JWT using `PyJWT` + `SUPABASE_JWT_SECRET`. Returns `AuthUser(user_id, email, role)`.
 4. **Database**: Supabase Row-Level Security policies enforce `auth.uid() = user_id` — users can only access their own rows.
 
-### Protected endpoints
-| Method | Path | Auth |
-|---|---|---|
-| `POST` | `/api/upload` | Optional (anonymous uploads allowed) |
-| `POST` | `/api/process` | Optional |
-| `POST` | `/api/agent/run` | Optional (user_id stamped when present) |
-| `GET` | `/api/agent/runs` | Optional (scoped to user when authenticated) |
-| `GET` | `/api/agent/runs/{id}` | Optional |
-| `GET` | `/api/workspaces` | **Required** |
-| `POST` | `/api/workspaces` | **Required** |
-
 ---
 
 ## 🤖 Agent Workflow
@@ -211,12 +218,13 @@ Agentloop relies on the **DS-STAR Orchestrator** pattern:
 4. **[Coder](docs/coder_agent.md)**: Translates each plan step into self-contained Python code.
 5. **[Code Executor](docs/code_executor.md)**: Runs generated code in an isolated sandbox.
 6. **[Debugger](docs/debugger_agent.md)**: Surgically corrects failing code blocks.
-7. **[Verifier](docs/verifier_agent.md) & [Router](docs/router_agent.md)**: Evaluate output and re-route for retries.
-8. **[Finalizer](docs/finalizer_agent.md)**: Converts execution output into clean Markdown insights.
+7. **[Verifier](docs/verifier_agent.md)**: Evaluates execution output against user constraints.
+8. **[Router](docs/router_agent.md)**: Decides whether to return results or retry (routes back to Planner/Coder).
+9. **[Finalizer](docs/finalizer_agent.md)**: Converts execution output into clean Markdown insights.
 
 **DS-STAR+** extends with:
-- **[SubQuestionGenerator](docs/subquestion_generator_agent.md)**: Decomposes open-ended queries into sub-questions.
-- **[ReportWriter](docs/report_writer_agent.md)**: Synthesizes parallel sub-runs into a research report.
+- **[SubQuestionGenerator](docs/subquestion_generator_agent.md)**: Decomposes open-ended queries into parallel sub-questions.
+- **[ReportWriter](docs/report_writer_agent.md)**: Synthesizes parallel sub-runs into a comprehensive research report.
 
 ---
 
@@ -294,35 +302,3 @@ npm run dev
 cd backend
 python -m pytest tests/ -v
 ```
-
----
-
-## 🔌 API Reference
-
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| `POST` | `/api/upload` | Optional | Upload files to session-scoped cache |
-| `POST` | `/api/process` | Optional | Build in-memory document context |
-| `POST` | `/api/agent/run` | Optional | Start DS-STAR agent run (SSE stream) |
-| `GET` | `/api/agent/runs` | Optional | List past runs (scoped to user) |
-| `GET` | `/api/agent/runs/{id}` | Optional | Get a single run by ID |
-| `GET` | `/api/workspaces` | **Required** | List authenticated user's workspaces |
-| `POST` | `/api/workspaces` | **Required** | Create a new workspace |
-| `DELETE` | `/api/clear` | Optional | Wipe session file cache |
-| `GET` | `/api/eval/*` | Public | Evaluation metrics endpoints |
-
----
-
-## 🤝 Contributing
-
-1. Fork the repository.
-2. Create a feature branch: `git checkout -b feature/amazing-feature`
-3. Commit changes: `git commit -m 'feat: add amazing feature'`
-4. Push: `git push origin feature/amazing-feature`
-5. Open a Pull Request.
-
----
-
-## 📄 License
-
-MIT License — see [LICENSE](LICENSE) for details.

@@ -12,6 +12,8 @@
  * the singleton supabaseClient which reads from VITE_* env vars.
  */
 
+/* eslint-disable react-refresh/only-export-components */
+
 import React, {
   createContext,
   useContext,

@@ -61,10 +61,19 @@ export async function uploadFiles(files, onProgress, sessionId = '', accessToken
   const formData = new FormData()
   files.forEach((file) => formData.append('files', file._raw, file.name))
 
-  let url = `${BASE}/upload`
+  // Use workspace-scoped endpoint when workspaceId is available.
+  // This writes to workspace_files table + saves to disk, fixing the
+  // "files disappear" bug where the legacy /upload wrote to uploaded_files
+  // but the agent context read from workspace_files.
+  let url
   const params = new URLSearchParams()
   if (sessionId) params.append('session_id', sessionId)
-  if (workspaceId) params.append('workspace_id', workspaceId)
+
+  if (workspaceId) {
+    url = `${BASE}/workspaces/${workspaceId}/upload`
+  } else {
+    url = `${BASE}/upload`
+  }
   if (params.toString()) url += '?' + params.toString()
 
   return new Promise((resolve, reject) => {
@@ -92,14 +101,14 @@ export async function uploadFiles(files, onProgress, sessionId = '', accessToken
             onProgress(file.id, rejected ? -1 : 100)
           })
           resolve(data)
-        } catch (err) {
+        } catch {
           reject(new Error('Invalid JSON response'))
         }
       } else {
         try {
           const errData = JSON.parse(xhr.responseText)
           reject(new Error(errData.detail || errData.message || `Upload failed with status ${xhr.status}`))
-        } catch (e) {
+        } catch {
           reject(new Error(`Upload failed with status ${xhr.status}`))
         }
       }

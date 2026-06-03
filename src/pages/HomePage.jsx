@@ -18,6 +18,7 @@ export function HomePage({ fileState, agentState }) {
 
   const {
     files,
+    filesLoading,
     pendingDuplicates,
     sessionId,
     handleAddFiles,
@@ -48,10 +49,6 @@ export function HomePage({ fileState, agentState }) {
     handleReset,
     fetchHistory,
     loadRun,
-    runMetrics,
-    totalRunMs,
-    complexity,
-    showMetrics,
   } = agentState
 
   const { user, isAuthenticated, signOut, loading: authLoading } = useAuth()
@@ -126,14 +123,6 @@ export function HomePage({ fileState, agentState }) {
           </div>
 
           <div className="flex items-center gap-3">
-            <Link
-              to="/eval"
-              className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-slate-200
-                         text-[12px] font-semibold bg-white text-slate-700
-                         shadow-sm hover:bg-slate-50 transition-colors"
-            >
-              <BarChart2 size={13} className="text-violet-600" />
-            </Link>
 
             <AgentSettings
               settings={settings}
@@ -192,6 +181,7 @@ export function HomePage({ fileState, agentState }) {
           <div className="glass-card-elevated h-full flex flex-col min-h-0 p-5">
             <FileUploadPanel
               files={files}
+              filesLoading={filesLoading}
               onAddFiles={handleAddFiles}
               onRemoveFile={handleRemoveFile}
               onClearAll={handleClearAll}
@@ -234,10 +224,6 @@ export function HomePage({ fileState, agentState }) {
               activeRunId={activeRunId}
               onReset={handleReset}
               onRerun={() => rerunLastQuery(sessionId)}
-              runMetrics={runMetrics}
-              totalRunMs={totalRunMs}
-              complexity={complexity}
-              showMetrics={showMetrics}
             />
           </div>
         </section>

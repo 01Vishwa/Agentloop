@@ -27,6 +27,7 @@ AUTH fix:
 - user_id from the authenticated token is forwarded to service layers.
 """
 
+import asyncio
 import time as _time
 import io
 import zipfile
@@ -40,9 +41,8 @@ from pydantic import BaseModel
 
 from api.controllers.agent_controller import handle_agent_run
 from api.controllers.process_controller import handle_clear, handle_process
-from api.controllers.upload_controller import handle_upload
+from api.controllers.upload_controller import handle_upload, handle_workspace_upload, handle_delete_workspace_file
 from api.controllers.research_controller import handle_research_run
-from eval.eval_routes import eval_router
 from core.deep_research_orchestrator import is_open_ended
 from core.config import SESSION_TTL_SECONDS, MAX_SESSIONS
 from middleware.auth import AuthUser, get_current_user
@@ -52,7 +52,6 @@ from services.upload_service import clear_file_cache
 logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter()
-router.include_router(eval_router, prefix="/eval")
 
 # ---------------------------------------------------------------------------
 # ARCH-02: Session context store with TTL eviction and size cap
@@ -107,8 +106,6 @@ def _set_session(key: str, data: Dict[str, Any]) -> None:
     _session_timestamps[key] = _time.monotonic()
 
 
-import asyncio
-
 # B2 fix: @router.on_event("startup") silently no-ops on APIRouter — the
 # eviction loop is registered on the FastAPI app instance in main.py instead.
 # See: _start_session_eviction_loop() in main.py.
@@ -123,6 +120,18 @@ class ProcessRequest(BaseModel):
 
     files: List[str]
     session_id: Optional[str] = None
+
+
+class CreateWorkspaceRequest(BaseModel):
+    """Request body for the POST /workspaces endpoint.
+
+    P2-05 fix: replaced raw Dict[str, Any] with a typed Pydantic model so
+    OpenAPI clients get a proper schema and FastAPI returns 422 (not 500)
+    when required fields are missing.
+    """
+
+    name: str
+    description: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -158,10 +167,14 @@ async def list_files(
     workspace_id: Optional[str] = Query(default=None),
     auth: AuthUser = Depends(get_current_user),
 ) -> List[Dict[str, Any]]:
-    """Lists files uploaded by the user, optionally scoped to a workspace."""
+    """Lists files uploaded by the current user, optionally scoped to a workspace.
+
+    P2-04 fix: passes user_id so the Supabase query filters by the
+    authenticated user, preventing cross-user file visibility.
+    """
     try:
         from services.supabase_service import list_uploaded_files  # pylint: disable=import-outside-toplevel
-        return await list_uploaded_files(workspace_id=workspace_id)
+        return await list_uploaded_files(user_id=auth.user_id, workspace_id=workspace_id)
     except Exception as exc:  # pylint: disable=broad-except
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -175,6 +188,9 @@ async def process_batch(
 
     Merges results into the session's existing context rather than replacing
     it wholesale, so multiple /process calls accumulate files correctly.
+
+    BUG 4 fix: Includes ``parse_warnings`` in the response so the frontend
+    can alert the user to near-empty files before they start an agent run.
     """
     session_key = request.session_id or str(auth.user_id)
     logger.info(
@@ -196,14 +212,33 @@ async def process_batch(
         **existing.get("combined_extractions", {}),
         **new_details.get("combined_extractions", {}),
     }
+
+    # BUG 4: accumulate parse_warnings across multiple /process calls
+    existing_warnings = existing.get("parse_warnings", [])
+    new_warnings = new_details.get("parse_warnings", [])
+    merged_warnings = existing_warnings + new_warnings
+
+    # Log each warning so server-side monitoring catches sparse files
+    for pw in new_warnings:
+        logger.warning(
+            "[Process] ParseWarning for '%s': %s",
+            pw.get("filename", "?"),
+            pw.get("message", ""),
+        )
+
     merged = {
         **new_details,
         "combined_extractions": merged_extractions,
         "files_processed": len(merged_extractions),
+        "parse_warnings": merged_warnings,
     }
     _set_session(session_key, merged)
 
+    # Surface parse_warnings in the HTTP response so the React frontend
+    # can show them immediately (before any agent run is started).
+    result["parse_warnings"] = new_warnings
     return result
+
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +275,7 @@ async def agent_run(
             temperature=request.temperature,
             user_id=user_id,
             workspace_id=request.workspace_id,
+            http_request=http_request,  # P2-02: enables disconnect monitoring
         )
     else:
         logger.info(
@@ -461,16 +497,141 @@ async def workspace_stats(
 
 @router.post("/workspaces")
 async def create_workspace(
-    payload: Dict[str, Any],
+    payload: CreateWorkspaceRequest,
     auth: AuthUser = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """Creates a new workspace for the authenticated user."""
-    name = payload.get("name", "").strip()
+    """Creates a new workspace for the authenticated user.
+
+    P2-05 fix: accepts a typed Pydantic body instead of raw Dict; field
+    validation (name required, max length) is handled by the model.
+    """
+    name = payload.name.strip()
     if not name:
-        raise HTTPException(status_code=422, detail="Workspace name is required.")
+        raise HTTPException(status_code=422, detail="Workspace name cannot be blank.")
     try:
         from services.supabase_service import create_workspace as _create  # pylint: disable=import-outside-toplevel
         return await _create(user_id=auth.user_id, name=name)
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/workspaces/{workspace_id}/upload")
+async def workspace_upload_files(
+    workspace_id: str,
+    files: List[UploadFile] = File(...),
+    session_id: Optional[str] = Query(default=None),
+    auth: AuthUser = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Uploads one or more files into a workspace session.
+
+    Saves each file to disk at /workspace/{workspace_id}/{filename},
+    extracts schema_json and row_count via the appropriate parser,
+    inserts a workspace_files row, then returns a MultiFileContext
+    with all current workspace files and inferred join candidates.
+
+    Args:
+        workspace_id: Target workspace UUID (from path).
+        files: Multipart file upload(s).
+        session_id: Optional session identifier for in-memory cache scoping.
+        auth: Authenticated user (from JWT).
+
+    Returns:
+        JSON with accepted_files, rejected_files, and multi_file_context.
+    """
+    effective_session = session_id or str(auth.user_id)
+    file_names = [f.filename for f in files]
+    logger.info(
+        "[WorkspaceUpload] workspace=%s user=%s files=%s (%d)",
+        workspace_id[:8],
+        str(auth.user_id)[:8],
+        ", ".join(file_names),
+        len(file_names),
+    )
+    try:
+        return await handle_workspace_upload(
+            files=files,
+            workspace_id=workspace_id,
+            user_id=str(auth.user_id),
+            session_id=effective_session,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.delete("/workspaces/{workspace_id}/files/{file_id}")
+async def delete_workspace_file(
+    workspace_id: str,
+    file_id: str,
+    auth: AuthUser = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Removes a single file from a workspace and returns the refreshed MultiFileContext.
+
+    Deletes the workspace_files row (verified to belong to the authenticated user),
+    removes the physical file from disk (best-effort), then re-runs schema_merger
+    on the remaining files to produce an updated MultiFileContext.
+
+    Args:
+        workspace_id: Workspace UUID (from path).
+        file_id: UUID of the workspace_files row to delete.
+        auth: Authenticated user (from JWT).
+
+    Returns:
+        JSON with deleted (bool) and multi_file_context.
+    """
+    logger.info(
+        "[WorkspaceFileDelete] workspace=%s file=%s user=%s",
+        workspace_id[:8],
+        file_id[:8],
+        str(auth.user_id)[:8],
+    )
+    try:
+        return await handle_delete_workspace_file(
+            file_id=file_id,
+            workspace_id=workspace_id,
+            user_id=str(auth.user_id),
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve)) from ve
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/workspaces/{workspace_id}/files")
+async def list_workspace_files_endpoint(
+    workspace_id: str,
+    auth: AuthUser = Depends(get_current_user),
+) -> List[Dict[str, Any]]:
+    """Lists files belonging to a workspace, formatted for the frontend upload panel.
+
+    Returns workspace_files rows with keys the frontend expects:
+    id, filename, file_size, file_url, file_type, schema_json, row_count.
+
+    Args:
+        workspace_id: Workspace UUID (from path).
+        auth: Authenticated user (from JWT).
+
+    Returns:
+        List of file metadata dicts.
+    """
+    try:
+        from services.supabase_service import list_workspace_files  # pylint: disable=import-outside-toplevel
+        rows = await list_workspace_files(
+            workspace_id=workspace_id,
+            user_id=str(auth.user_id),
+        )
+        # Reshape for frontend compatibility
+        return [
+            {
+                "id": r.get("id"),
+                "filename": r.get("file_name", ""),
+                "file_size": r.get("file_size") or 0,
+                "file_url": r.get("file_url") or "",
+                "file_type": r.get("file_type", ""),
+                "schema_json": r.get("schema_json"),
+                "row_count": r.get("row_count"),
+            }
+            for r in rows
+        ]
     except Exception as exc:  # pylint: disable=broad-except
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

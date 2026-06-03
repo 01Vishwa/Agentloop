@@ -12,7 +12,7 @@
 import { useState, useCallback, useRef } from 'react'
 import { toast } from '../components/shared/Toast'
 import { createCancellableStream } from '../services/agentApi'
-import { DEFAULT_SETTINGS } from '../components/agent/AgentSettings'
+import { DEFAULT_SETTINGS } from '../components/agent/agentSettingsConstants'
 import { useAuth } from '../contexts/AuthContext'
 import { useWorkspaceStore } from '../stores/workspaceStore'
 
@@ -41,11 +41,6 @@ export function useAgentRun(files) {
   const [historyLoading, setHistoryLoading] = useState(false)
   const [settings, setSettings] = useState({ ...DEFAULT_SETTINGS })
   const [activeRunId, setActiveRunId] = useState(null)
-  // Evaluation metrics (from 'metrics' SSE event)
-  const [runMetrics, setRunMetrics] = useState(null)
-  const [totalRunMs, setTotalRunMs] = useState(0)
-  const [complexity, setComplexity] = useState('easy')
-  const [showMetrics, setShowMetrics] = useState(false)
   const [lastSubmittedQuery, setLastSubmittedQuery] = useState('')
 
   // Deep Research mode state
@@ -354,17 +349,6 @@ export function useAgentRun(files) {
         setTimeout(() => fetchHistory(20, true), 1500)
         break
 
-      case 'metrics':
-        setRunMetrics(payload.metrics || null)
-        setTotalRunMs(payload.total_run_ms || 0)
-        setComplexity(payload.complexity || 'easy')
-        setShowMetrics(true)
-        addLog(
-          `[Metrics] Task complexity: ${payload.complexity || 'easy'} · Total: ${Math.round((payload.total_run_ms || 0) / 1000)}s`,
-          'info',
-        )
-        break
-
       case 'warning':
         addLog('[⚠] ' + payload.message, 'warn')
         break
@@ -424,10 +408,6 @@ export function useAgentRun(files) {
       setOutput(null)
       setVerifierFeedback(null)
       setActiveRunId(null)
-      setRunMetrics(null)
-      setTotalRunMs(0)
-      setComplexity('easy')
-      setShowMetrics(false)
       setIsResearchMode(false)
       setSubQuestions([])
       setResearchReport(null)
@@ -497,10 +477,6 @@ export function useAgentRun(files) {
     setOutput(null)
     setVerifierFeedback(null)
     setActiveRunId(null)
-    setRunMetrics(null)
-    setTotalRunMs(0)
-    setComplexity('easy')
-    setShowMetrics(false)
     setIsResearchMode(false)
     setSubQuestions([])
     setResearchReport(null)
@@ -565,11 +541,6 @@ export function useAgentRun(files) {
     handleReset,
     fetchHistory,
     loadRun,
-    // Evaluation metrics
-    runMetrics,
-    totalRunMs,
-    complexity,
-    showMetrics,
     lastSubmittedQuery,
     // Deep Research state
     isResearchMode,

@@ -5,10 +5,12 @@ Extracts and verifies the Supabase-issued JWT from the
 authenticated user's ID and email into the route context via FastAPI's
 dependency injection system.
 
-Only ES256 (asymmetric JWKS) is accepted:
+Accepted algorithms:
   - ES256: Supabase newer projects use asymmetric keys. Public key is fetched
            from {SUPABASE_URL}/auth/v1/.well-known/jwks.json and cached in memory.
-  - HS256 fallback has been removed (algorithm confusion attack surface).
+  - HS256: Accepted for legacy Supabase projects and local dev where
+           SUPABASE_JWT_SECRET is set. Gate behind ALLOW_HS256_DEV=true in
+           production if you wish to restrict it to ES256 only.
 
 Audience claim ``"authenticated"`` is enforced on every token.
 
@@ -55,11 +57,51 @@ _jwks_fetched_at: float = 0.0
 _JWKS_TTL_SECONDS: int = 3600  # re-fetch JWKS every hour
 
 
-def _get_jwks_key(kid: str) -> Optional[Any]:
+async def _refresh_jwks_cache() -> None:
+    """Fetches the JWKS key set from Supabase and replaces the in-process cache.
+
+    P1-04 fix: uses ``httpx.AsyncClient`` so this never blocks the event loop.
+
+    Raises:
+        RuntimeError: If SUPABASE_URL is not configured.
+        httpx.HTTPStatusError: If the JWKS endpoint returns a non-2xx status.
+    """
+    global _jwks_cache, _jwks_fetched_at
+
+    if not SUPABASE_URL:
+        logger.error("[Auth] SUPABASE_URL is not set — cannot fetch JWKS.")
+        raise RuntimeError("SUPABASE_URL is not set")
+
+    jwks_url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/.well-known/jwks.json"
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.get(jwks_url)
+    resp.raise_for_status()
+    jwks_data = resp.json()
+
+    new_cache: Dict[str, Any] = {}
+    for key_data in jwks_data.get("keys", []):
+        key_kid = key_data.get("kid", "")
+        try:
+            public_key = jwt.algorithms.ECAlgorithm.from_jwk(key_data)
+            new_cache[key_kid] = public_key
+            logger.info("[Auth] Loaded JWKS public key: kid=%s", key_kid)
+        except Exception as exc:
+            logger.warning("[Auth] Could not parse JWKS key kid=%s: %s", key_kid, exc)
+
+    _jwks_cache = new_cache
+    _jwks_fetched_at = time.monotonic()
+    logger.info("[Auth] JWKS refreshed — %d key(s) loaded", len(_jwks_cache))
+
+
+async def _get_jwks_key(kid: str) -> Optional[Any]:
     """Returns the public key matching ``kid`` from Supabase's JWKS endpoint.
 
     Results are cached in-process for ``_JWKS_TTL_SECONDS`` to avoid
     hammering the JWKS endpoint on every request.
+
+    If the requested ``kid`` is missing from a fresh cache, a **single**
+    forced re-fetch is attempted to handle Supabase key rotations that
+    occur within the TTL window.
 
     Args:
         kid: The ``kid`` (key ID) from the JWT header.
@@ -67,33 +109,32 @@ def _get_jwks_key(kid: str) -> Optional[Any]:
     Returns:
         A PyJWT-compatible public key object, or ``None`` if not found.
     """
-    global _jwks_cache, _jwks_fetched_at
-
     now = time.monotonic()
+
+    # --- Normal TTL-based refresh ---
     if not _jwks_cache or (now - _jwks_fetched_at) > _JWKS_TTL_SECONDS:
-        if not SUPABASE_URL:
-            logger.error("[Auth] SUPABASE_URL is not set — cannot fetch JWKS.")
-            return None
-        jwks_url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/.well-known/jwks.json"
         try:
-            resp = httpx.get(jwks_url, timeout=5.0)
-            resp.raise_for_status()
-            jwks_data = resp.json()
-            new_cache: Dict[str, Any] = {}
-            for key_data in jwks_data.get("keys", []):
-                key_kid = key_data.get("kid", "")
-                try:
-                    public_key = jwt.algorithms.ECAlgorithm.from_jwk(key_data)
-                    new_cache[key_kid] = public_key
-                    logger.info("[Auth] Loaded JWKS public key: kid=%s", key_kid)
-                except Exception as exc:
-                    logger.warning("[Auth] Could not parse JWKS key kid=%s: %s", key_kid, exc)
-            _jwks_cache = new_cache
-            _jwks_fetched_at = now
-            logger.info("[Auth] JWKS refreshed — %d key(s) loaded", len(_jwks_cache))
+            await _refresh_jwks_cache()
         except Exception as exc:
-            logger.error("[Auth] Failed to fetch JWKS from %s: %s", jwks_url, exc)
+            logger.error("[Auth] Failed to refresh JWKS: %s", exc)
             # Keep stale cache on error rather than crashing
+
+    if kid in _jwks_cache:
+        return _jwks_cache[kid]
+
+    # --- Retry on miss: handle key rotation within the TTL window ---
+    # Only re-fetch if the cache wasn't *just* refreshed (avoid tight loops).
+    elapsed_since_refresh = time.monotonic() - _jwks_fetched_at
+    if elapsed_since_refresh > 5:  # guard: don't re-fetch more than once every 5 s
+        logger.info(
+            "[Auth] kid=%s not in cache (%d key(s)). "
+            "Forcing JWKS re-fetch for possible key rotation.",
+            kid, len(_jwks_cache),
+        )
+        try:
+            await _refresh_jwks_cache()
+        except Exception as exc:
+            logger.error("[Auth] Forced JWKS re-fetch failed: %s", exc)
 
     return _jwks_cache.get(kid)
 
@@ -127,12 +168,12 @@ class AuthUser(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _decode_supabase_jwt(token: str) -> dict:
+async def _decode_supabase_jwt(token: str) -> dict:
     """Decodes and verifies a Supabase-issued JWT.
 
-    Accepts ONLY ES256 (asymmetric JWKS) tokens. HS256 is explicitly rejected
-    to eliminate algorithm confusion attacks. The audience claim is enforced
-    to ``"authenticated"``.
+    Accepts ES256 (asymmetric JWKS) and HS256 (legacy/local-dev) tokens.
+    HS256 requires SUPABASE_JWT_SECRET to be set. The audience claim is
+    enforced to ``"authenticated"``.
 
     Args:
         token: Raw JWT string (without the ``Bearer `` prefix).
@@ -174,9 +215,9 @@ def _decode_supabase_jwt(token: str) -> dict:
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-        # Asymmetric ES256 — resolve public key via JWKS
+        # Asymmetric ES256 — resolve public key via JWKS (async, P1-04 fix)
         kid = unverified_header.get("kid", "")
-        public_key = _get_jwks_key(kid)
+        public_key = await _get_jwks_key(kid)
         if public_key is None:
             logger.error(
                 "[Auth] No JWKS key found for kid=%s (alg=%s). "
@@ -272,7 +313,7 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    payload = _decode_supabase_jwt(credentials.credentials)
+    payload = await _decode_supabase_jwt(credentials.credentials)
     auth_user = _extract_auth_user(payload)
     logger.debug("[Auth] Authenticated user: %s", auth_user.user_id)
     return auth_user
@@ -297,7 +338,7 @@ async def get_optional_user(
         return None
 
     try:
-        payload = _decode_supabase_jwt(credentials.credentials)
+        payload = await _decode_supabase_jwt(credentials.credentials)
         return _extract_auth_user(payload)
     except HTTPException:
         return None

@@ -7,7 +7,7 @@ import {
 import { CodeBlock } from './CodeBlock'
 
 // Strip leading markdown/unicode bullet characters so CSS dot + embedded char don't double-up.
-const cleanBullet = (s) => s.replace(/^[•\-\*]\s*/, '').trim()
+const cleanBullet = (s) => s.replace(/^[•\-*]\s*/, '').trim()
 
 // ─── Status Panel ────────────────────────────────────────────────────────────
 function StatusPanel({ status }) {

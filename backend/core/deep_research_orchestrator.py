@@ -30,6 +30,35 @@ from core.config import DS_STAR_PLUS_MAX_WORKERS, DS_STAR_PLUS_MAX_ROUNDS
 
 logger = logging.getLogger("uvicorn.info")
 
+def _make_ds_star_orchestrator(
+    model: Optional[str],
+    coder_model: Optional[str],
+    temperature: Optional[float],
+) -> DsStarOrchestrator:
+    """Instantiates a **fresh** DsStarOrchestrator for a single sub-question run.
+
+    P0 fix: the previous module-level cache (_ds_star_cache) shared one
+    DsStarOrchestrator instance across all concurrent sub-question tasks.
+    Because DsStarOrchestrator.coder (CoderAgent) carries mutable run-level
+    state (``_raw_mode_engaged``), a single schema failure in any parallel
+    task would call ``force_raw_completion()`` and permanently corrupt the
+    shared instance for ALL concurrent and future sub-questions.
+
+    Instantiating a fresh orchestrator per sub-question is the only safe
+    option: each object's agents are stateless between instantiation and the
+    end of ``run()``, so the 8-agent construction cost (~1 ms, no I/O) is
+    negligible compared to the LLM round-trip latency.
+    """
+    logger.debug(
+        "[DeepResearch] Creating fresh DsStarOrchestrator — model=%s, coder=%s",
+        model, coder_model,
+    )
+    return DsStarOrchestrator(
+        model=model,
+        coder_model=coder_model,
+        temperature=temperature,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Open-ended query classifier
@@ -70,21 +99,21 @@ def is_open_ended(query: str) -> bool:
 async def _run_single_ds_star(
     question: str,
     context: Dict[str, Any],
-    model: Optional[str],
-    coder_model: Optional[str],
-    temperature: Optional[float],
+    orchestrator: DsStarOrchestrator,
     max_rounds: int,
     sub_run_id: str,
     session_id: str = "__anon__",
 ) -> Dict[str, Any]:
     """Runs a complete DS-STAR loop for one sub-question and returns its result.
 
+    P1-06 fix: accepts a pre-built, cached ``DsStarOrchestrator`` instead of
+    instantiating one per sub-question. ``max_rounds`` is forwarded into
+    ``orchestrator.run()`` (not mutated on the shared instance).
+
     Args:
         question: The atomic sub-question to answer.
         context: Processing context passed from the research endpoint.
-        model: LLM model override (Pro tier).
-        coder_model: LLM model override for code generation.
-        temperature: Sampling temperature override.
+        orchestrator: Shared cached DsStarOrchestrator instance.
         max_rounds: Maximum orchestrator rounds per sub-question.
         sub_run_id: Unique run ID for this sub-question run.
         session_id: Client session identifier — scopes executor file access so
@@ -93,13 +122,6 @@ async def _run_single_ds_star(
     Returns:
         Dict containing status, execution_output, insights, code, rounds, run_id.
     """
-    orchestrator = DsStarOrchestrator(
-        max_rounds=max_rounds,
-        model=model,
-        coder_model=coder_model,
-        temperature=temperature,
-    )
-
     result: Dict[str, Any] = {
         "status": "failed",
         "execution_output": "",
@@ -111,7 +133,11 @@ async def _run_single_ds_star(
 
     try:
         async for event in orchestrator.run(
-            question, context, run_id=sub_run_id, session_id=session_id
+            question,
+            context,
+            run_id=sub_run_id,
+            session_id=session_id,
+            max_rounds=max_rounds,
         ):
             event_type = event.get("event")
             payload = event.get("payload", {})
@@ -199,6 +225,7 @@ class DeepResearchOrchestrator:
         context: Dict[str, Any],
         report_id: str = "",
         session_id: str = "__anon__",
+        max_rounds: Optional[int] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Executes the DS-STAR+ research loop and yields SSE events.
 
@@ -210,10 +237,17 @@ class DeepResearchOrchestrator:
             session_id: Client session identifier — forwarded to all
                 sub-question DS-STAR runs so their executors access the
                 correct session file bucket instead of ``__anon__``.
+            max_rounds: Per-call round limit for sub-question runs.
+                When provided, overrides ``self._max_rounds`` for this
+                invocation only (P1-01 fix: no mutation of shared state).
 
         Yields:
             AgentEvent dicts for SSE streaming.
         """
+        # Resolve effective rounds locally — never write to self._max_rounds
+        _effective_max_rounds: int = (
+            max_rounds if max_rounds is not None else self._max_rounds
+        )
         run_t0 = time.monotonic()
         report_id = report_id or uuid.uuid4().hex
         combined = context.get("combined_extractions", {})
@@ -296,24 +330,33 @@ class DeepResearchOrchestrator:
         semaphore = asyncio.Semaphore(self._max_workers)
 
         async def _run_with_semaphore(i: int, question: str) -> Dict[str, Any]:
+            # Build the started event BEFORE acquiring the semaphore so
+            # its data is ready, but it is returned alongside the result
+            # for the outer loop to yield in order.
+            started_event = _event(
+                "subquestion_started",
+                message=f"[Q{i + 1}] Running: {question[:80]}",
+                index=i,
+                question=question,
+                sub_run_id=sub_run_ids[i],
+            )
             async with semaphore:
-                yield_event = _event(
-                    "subquestion_started",
-                    message=f"[Q{i + 1}] Running: {question[:80]}",
-                    index=i,
-                    question=question,
-                    sub_run_id=sub_run_ids[i],
-                )
+                # P1-03 fix: event is now created BEFORE the await so it
+                # accurately represents when the task entered execution.
                 logger.info(
                     "[DeepResearch] Q%d started | run_id=%s", i + 1, sub_run_ids[i]
+                )
+                # P0 fix: always construct a fresh orchestrator per sub-question.
+                # Sharing a single instance causes CoderAgent._raw_mode_engaged
+                # to leak across parallel tasks on schema failure.
+                sub_orchestrator = _make_ds_star_orchestrator(
+                    self._model, self._coder_model, self._temperature
                 )
                 result = await _run_single_ds_star(
                     question=question,
                     context=context,
-                    model=self._model,
-                    coder_model=self._coder_model,
-                    temperature=self._temperature,
-                    max_rounds=self._max_rounds,
+                    orchestrator=sub_orchestrator,
+                    max_rounds=_effective_max_rounds,
                     sub_run_id=sub_run_ids[i],
                     session_id=session_id,
                 )
@@ -323,7 +366,7 @@ class DeepResearchOrchestrator:
                     result["status"],
                     sub_run_ids[i],
                 )
-                return yield_event, result
+                return started_event, result
 
         # Run all sub-questions concurrently under semaphore
         tasks = [
@@ -422,13 +465,16 @@ class DeepResearchOrchestrator:
 
                 async def _sup_run(i: int, question: str) -> Dict[str, Any]:
                     async with sup_semaphore:
+                        # P0 fix: fresh orchestrator per supplementary question —
+                        # same race-condition isolation as the primary run above.
+                        sup_orchestrator = _make_ds_star_orchestrator(
+                            self._model, self._coder_model, self._temperature
+                        )
                         return await _run_single_ds_star(
                             question=question,
                             context=context,
-                            model=self._model,
-                            coder_model=self._coder_model,
-                            temperature=self._temperature,
-                            max_rounds=self._max_rounds,
+                            orchestrator=sup_orchestrator,
+                            max_rounds=_effective_max_rounds,
                             sub_run_id=sup_run_ids[i],
                             session_id=session_id,
                         )

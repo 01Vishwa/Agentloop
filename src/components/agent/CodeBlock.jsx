@@ -1,7 +1,7 @@
 import React, { useState } from 'react'
 import { Copy, Check } from 'lucide-react'
 
-export function CodeBlock({ codeByTab, collapsed, onToggleCollapse }) {
+export function CodeBlock({ codeByTab, collapsed }) {
   const tabs = Object.keys(codeByTab || {})
   const [activeTab, setActiveTab] = useState(tabs[0])
   const [copied, setCopied] = useState(false)

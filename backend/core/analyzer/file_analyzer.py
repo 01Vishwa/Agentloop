@@ -173,6 +173,100 @@ class FileAnalyzerAgent:
         )
         return description
 
+    async def analyze_multi(
+        self,
+        context,  # MultiFileContext
+        session_id: str = "__anon__",
+    ) -> str:
+        """Builds a data description from a MultiFileContext.
+
+        For single-file contexts, delegates to the standard ``analyze()`` path
+        so the existing orchestrator behaviour is preserved exactly.
+
+        For multi-file contexts (2+ files), prepends the compact
+        ``MultiFileContext.to_prompt_str()`` summary and appends a multi-file
+        analysis instruction so the LLM knows join keys are available.
+
+        Args:
+            context: A MultiFileContext instance from schema_merger.
+            session_id: Session identifier for file content lookup.
+
+        Returns:
+            Multi-section data description string ready for agent prompts.
+        """
+        from models.multi_file_context import MultiFileContext  # pylint: disable=import-outside-toplevel
+
+        files = context.files if context else []
+
+        if not files:
+            return "No data files are available in the current context."
+
+        if len(files) == 1:
+            # Single-file: fall through to the standard path
+            # Build a minimal combined_extractions dict from the FileSchema
+            fs = files[0]
+            dummy_extraction = {
+                "source_type": fs.file_type,
+                "sanitized_content": "",
+                "metadata": {
+                    "columns": [c.name for c in fs.columns],
+                    "dtypes": {c.name: c.dtype for c in fs.columns},
+                    "row_count": fs.row_count,
+                    "shape": [fs.row_count, len(fs.columns)],
+                    "sample_rows": [
+                        {c.name: (c.sample_values[0] if c.sample_values else None) for c in fs.columns}
+                    ],
+                },
+            }
+            return await self.analyze(
+                {fs.file_name: dummy_extraction},
+                session_id=session_id,
+            )
+
+        # Multi-file path
+        self._reset_chain()
+
+        # Build per-file descriptions using LLM or static fallback
+        file_sections = []
+        for fs in files:
+            dummy_extraction = {
+                "source_type": fs.file_type,
+                "sanitized_content": "",
+                "metadata": {
+                    "columns": [c.name for c in fs.columns],
+                    "dtypes": {c.name: c.dtype for c in fs.columns},
+                    "row_count": fs.row_count,
+                    "shape": [fs.row_count, len(fs.columns)],
+                    "sample_rows": [
+                        {c.name: (c.sample_values[0] if c.sample_values else None) for c in fs.columns}
+                    ],
+                },
+            }
+            section = await self._analyze_file_with_llm(fs.file_name, dummy_extraction, session_id)
+            if section is None:
+                section = self._analyze_file_static(fs.file_name, dummy_extraction)
+            file_sections.append(section)
+
+        # Compose multi-file description with join context header
+        join_context_header = (
+            "=== MULTI-FILE WORKSPACE ===\n"
+            + context.to_prompt_str()
+            + "\n\nYou are analysing a multi-file workspace. The user may ask questions "
+            "that require joining data across files. The detected join candidates are "
+            "listed above — treat these as probable but not certain. "
+            "Flag any ambiguity in your analysis output."
+        )
+
+        description = join_context_header + "\n\n=== DATA DESCRIPTION ===\n\n" + "\n\n".join(file_sections)
+
+        logger.info(
+            "[FileAnalyzer] Multi-file description: %d files, %d chars",
+            len(files),
+            len(description),
+        )
+        return description
+
+
     async def _analyze_file_with_llm(
         self, filename: str, doc: Dict[str, Any], session_id: str = "__anon__"
     ) -> "str | None":
@@ -213,9 +307,39 @@ class FileAnalyzerAgent:
                     line for line in lines if not line.strip().startswith("```")
                 )
 
-            # Inject file content into the script preamble
+            # Inject file content into the script preamble.
+            # First try the in-memory session cache; fall back to the workspace
+            # disk path so files uploaded via /workspaces/{id}/upload are found
+            # even when the session cache is keyed differently.
             from services.upload_service import get_file_content  # pylint: disable=import-outside-toplevel
             raw_bytes = get_file_content(filename, session_id=session_id) or b""
+
+            if not raw_bytes:
+                # Disk fallback: scan /workspace/ for the file
+                workspace_base = os.environ.get("WORKSPACE_FILES_DIR", "/workspace")
+                for _root, _dirs, _files in os.walk(workspace_base):
+                    if filename in _files:
+                        _candidate = os.path.join(_root, filename)
+                        try:
+                            with open(_candidate, "rb") as _fh:
+                                raw_bytes = _fh.read()
+                        except OSError:
+                            pass
+                        if raw_bytes:
+                            logger.info(
+                                "[FileAnalyzer] Loaded %s from disk fallback (%s).",
+                                filename, _candidate,
+                            )
+                        break
+
+            if not raw_bytes:
+                # No data anywhere — skip expensive LLM path, use static fallback
+                logger.warning(
+                    "[FileAnalyzer] No content found for %s (session=%s); "
+                    "using static fallback.",
+                    filename, session_id,
+                )
+                return None
 
             preamble = (
                 "import sys, io, json, re\n"

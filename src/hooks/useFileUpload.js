@@ -19,6 +19,27 @@ import { useWorkspaceStore } from '../stores/workspaceStore'
 let fileIdCounter = 0
 
 /**
+ * Maps a pandas dtype string to a user-friendly display label.
+ * e.g. "int64" → "INTEGER", "float64" → "FLOAT", "object" → "STRING"
+ *
+ * @param {string} dtype - Raw pandas dtype string
+ * @returns {string} User-friendly type label
+ */
+const mapPandasDtype = (dtype) => {
+  if (!dtype || typeof dtype !== 'string') return 'STRING'
+  const d = dtype.toLowerCase()
+  if (d.startsWith('int') || d === 'int64' || d === 'int32' || d === 'int16' || d === 'int8') return 'INTEGER'
+  if (d.startsWith('uint')) return 'INTEGER'
+  if (d.startsWith('float') || d === 'float64' || d === 'float32' || d === 'float16') return 'FLOAT'
+  if (d === 'bool' || d === 'boolean' || d.startsWith('bool')) return 'BOOLEAN'
+  if (d.startsWith('datetime') || d.includes('datetime')) return 'DATETIME'
+  if (d.startsWith('timedelta')) return 'TIMEDELTA'
+  if (d === 'category') return 'CATEGORY'
+  if (d === 'string' || d === 'object') return 'STRING'
+  return dtype.toUpperCase()
+}
+
+/**
  * Generates a stable session ID for this browser tab.
  * Uses crypto.randomUUID when available, falls back to a random hex string.
  *
@@ -94,10 +115,11 @@ const extractColumns = async (fileObj, filename, url = null) => {
 export function useFileUpload() {
   const [files, setFiles] = useState([])
   const [pendingDuplicates, setPendingDuplicates] = useState([])
+  const [filesLoading, setFilesLoading] = useState(false)
 
   // Auth token for API calls — reads live from AuthContext
   const { getAccessToken } = useAuth()
-  const { activeWorkspace } = useWorkspaceStore()
+  const { activeWorkspace, setMultiFileContext } = useWorkspaceStore()
 
   // Derive sessionId from the active projectId so that the backend file-cache
   // bucket is scoped per project. Falls back to a random UUID when no project
@@ -116,21 +138,37 @@ export function useFileUpload() {
   const fetchUploadedFiles = useCallback(async () => {
     if (!activeWorkspace?.id) return
     const token = getAccessToken()
+    setFilesLoading(true)
     try {
-      const res = await fetch(`/api/files?workspace_id=${activeWorkspace.id}`, {
+      // Use workspace-scoped endpoint which reads from workspace_files table.
+      // This is where workspace uploads (POST /workspaces/{id}/upload) save data.
+      // The old /api/files endpoint reads from uploaded_files table which is
+      // the wrong source for workspace-scoped files.
+      const res = await fetch(`/api/workspaces/${activeWorkspace.id}/files`, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       })
       if (res.ok) {
         const data = await res.json()
         const formattedFiles = await Promise.all(data.map(async (r, i) => {
-          const columns = await extractColumns(null, r.filename, r.file_url)
+          const columns = r.schema_json?.columns
+            ? r.schema_json.columns.map(c => {
+                // c can be a plain string (column name) or an object with .name/.dtype
+                const colName = typeof c === 'string' ? c : (c.name || c)
+                // Dtypes live in schema_json.dtypes as a separate dict: {"col": "int64", ...}
+                const rawDtype = (typeof c === 'object' && (c.dtype || c.type))
+                  || (r.schema_json.dtypes && r.schema_json.dtypes[colName])
+                  || 'string'
+                return { name: colName, type: mapPandasDtype(rawDtype) }
+              })
+            : await extractColumns(null, r.filename, r.file_url || null)
           return {
             id: 10000 + i,
+            dbId: r.id,
             name: r.filename,
             size: r.file_size,
             progress: 100,
             _raw: null,
-            url: r.file_url,
+            url: r.file_url || null,
             metadata: columns ? { columns } : null
           }
         }))
@@ -138,6 +176,8 @@ export function useFileUpload() {
       }
     } catch (err) {
       console.error(err)
+    } finally {
+      setFilesLoading(false)
     }
   }, [activeWorkspace?.id, getAccessToken])
 
@@ -172,12 +212,16 @@ export function useFileUpload() {
             `${acceptedNames.length} file${acceptedNames.length > 1 ? 's' : ''} uploaded successfully`,
             'success'
           )
+          // Store multiFileContext from workspace upload response for join inference
+          if (uploadResult.multi_file_context) {
+            setMultiFileContext(uploadResult.multi_file_context)
+          }
         } catch (err) {
           toast(`Processing error: ${err.message}`, 'error')
         }
       }
     },
-    [applyProgress, getAccessToken, sessionId, activeWorkspace?.id]
+    [applyProgress, getAccessToken, sessionId, activeWorkspace?.id, setMultiFileContext]
   )
 
   const handleAddFiles = useCallback(
@@ -254,6 +298,7 @@ export function useFileUpload() {
 
   return {
     files,
+    filesLoading,
     pendingDuplicates,
     sessionId,
     handleAddFiles,
